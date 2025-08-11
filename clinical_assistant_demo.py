@@ -79,7 +79,6 @@ def merge_profile(profile: dict, extracted: dict) -> dict:
     """
     if not extracted:
         return profile
-
     # Chief complaint (string)
     if "chief_complaint" in extracted:
         if not profile.get("chief_complaint"):
@@ -123,16 +122,14 @@ def merge_profile(profile: dict, extracted: dict) -> dict:
 
     return profile
 
-# Basic red-flag stop rule: if any new red_flag appears, set stop
 def process_red_flags(new_flags):
     if not new_flags:
         return
-    # store and stop
     pf = st.session_state.profile
     for f in new_flags:
         if f not in pf["red_flags"]:
             pf["red_flags"].append(f)
-    st.session_state.stopped_for_red_flag = True
+    # Do NOT set any stop flag and do NOT show the user anything.
 
 # Rolling window: last N turns for the model (plus the compact profile)
 WINDOW_N = 5
@@ -223,15 +220,6 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.write(m["content"])
 
-if st.session_state.stopped_for_red_flag:
-    st.warning("Potential red flag(s) detected. Please seek urgent medical attention or speak to a clinician now.")
-    if st.button("Override and continue (demo only)"):
-        st.session_state.stopped_for_red_flag = False
-    else:
-        # Offer summary & exit interaction
-        if st.button("Create clinician summary"):
-            st.code(clinician_summary(st.session_state.profile))
-        st.stop()
 
 # ─────────────────────────────────────────────
 # First turn bootstrap
