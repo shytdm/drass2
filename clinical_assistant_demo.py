@@ -1,4 +1,4 @@
-# clinical_assistant_demo.py — Simple "ChatGPT-style" full-history mode + AI summary
+# clinical_assistant_demo.py — ChatGPT-style intake + deterministic stop + 30-question cap + AI summary
 import json
 import streamlit as st
 from openai import OpenAI
@@ -10,7 +10,7 @@ st.set_page_config(page_title="Clinical Intake (Demo)", layout="centered")
 st.title("🩺 Clinical Intake – Chat Demo")
 st.caption("Prototype only. Not medical advice.")
 
-client = OpenAI()  # your key is already configured
+client = OpenAI()  # key already configured in your env/secrets
 
 # ─────────────────────────────────────────────
 # State
@@ -19,27 +19,72 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "profile" not in st.session_state:
     st.session_state.profile = {
-        "demographics": {},
+        "demographics": {},           # {age_years, sex, etc.}
         "chief_complaint": None,
-        "modules": {},            # model may add blobs like {"chest_pain": {...}}
-        "medications": [],
-        "allergies": [],
-        "red_flags": [],
+        "modules": {},                # symptom-specific blobs (model-defined)
+        "medications": [],            # [{name,dose,route,frequency}]
+        "allergies": [],              # [{substance,reaction}]
+        "past_medical_history": None, # free text or structured dict
+        "family_history": None,       # free text or structured dict
+        "social_history": None,       # free text or structured dict
+        "red_flags": [],              # collected silently
+        "red_flags_checked": False,   # model should set to true once screened
         "free_text_notes": []
     }
 if "asked_questions" not in st.session_state:
     st.session_state.asked_questions = []
 if "final_summary" not in st.session_state:
-    st.session_state.final_summary = None  # model-written clinician summary
+    st.session_state.final_summary = None
+if "q_count" not in st.session_state:
+    st.session_state.q_count = 0  # assistant questions asked (excludes final thank-you)
+
+MAX_QUESTIONS = 30  # hard cap
 
 # Seed opening question BEFORE rendering
 if not st.session_state.messages:
     opening = "What brings you in today?"
     st.session_state.messages.append({"role": "assistant", "content": opening})
     st.session_state.asked_questions.append(opening)
+    st.session_state.q_count = 1
 
 # ─────────────────────────────────────────────
-# System prompt (history taking & stop condition)
+# Deterministic stop rules
+# ─────────────────────────────────────────────
+REQUIRED_SECTIONS = [
+    "chief_complaint",
+    "demographics",
+    "past_medical_history",
+    "medications",
+    "allergies",
+    "family_history",
+    "social_history",
+    "red_flags_checked",
+]
+
+def history_complete(profile: dict) -> bool:
+    # chief complaint present
+    if not profile.get("chief_complaint"):
+        return False
+    # demographics minimally populated
+    demo = profile.get("demographics", {})
+    if not (demo.get("age_years") or demo.get("sex")):
+        return False
+    # PMH / FH / SH exist (allow non-empty strings or dicts)
+    if not profile.get("past_medical_history"):
+        return False
+    if not profile.get("family_history"):
+        return False
+    if not profile.get("social_history"):
+        return False
+    # meds & allergies can be empty lists, but we want them explicitly checked;
+    # require the keys exist (they do) — no extra condition here
+    # red flags checked boolean
+    if not bool(profile.get("red_flags_checked")):
+        return False
+    return True
+
+# ─────────────────────────────────────────────
+# System prompt (history taking & stop signal for the MODEL)
 # ─────────────────────────────────────────────
 SYSTEM = """
 You are a clinical intake assistant for a primary care clinic.
@@ -52,6 +97,11 @@ Your task each session:
 - Ask short, specific questions, ONE at a time.
 - NEVER give medical advice. NEVER tell the patient about red flags or urgency. Red flags go ONLY in the JSON `red_flags` array for the doctor's note.
 
+IMPORTANT:
+- Set `red_flags_checked` to true in `extracted_fields` once you have screened red flags relevant to the complaint.
+- Always parse any new info into `extracted_fields` so the app can track completion.
+- Do NOT repeat the last assistant question verbatim. If clarifying, rephrase and advance.
+
 When you have enough information to form a proper differential diagnosis and a concise history, STOP asking questions and output:
 
 {
@@ -61,7 +111,7 @@ When you have enough information to form a proper differential diagnosis and a c
   "rationale": "History completed"
 }
 
-While interviewing, reply EACH TURN with ONLY strict JSON (no backticks, no extra prose) with keys:
+Each turn, reply with ONLY strict JSON (no backticks, no extra prose) with keys:
 - next_question: string  # the single next question OR the final thank-you line
 - extracted_fields: object  # structured data parsed from the patient's last answer (mergeable)
 - red_flags: string[]  # any detected red flags (for clinician only)
@@ -74,9 +124,6 @@ Normalization:
 - Medications → [{name, dose, route, frequency}]
 - Allergies → [{substance, reaction}]
 - Pain → {location, quality, severity_0_to_10, onset, duration, radiation, aggravating, relieving, associated}
-
-De-duplication:
-- Do NOT repeat the last assistant question verbatim. If clarifying, rephrase and advance.
 
 Output ONLY the JSON object. Nothing else.
 """
@@ -94,37 +141,54 @@ Routing hint examples (do not repeat to user):
 def merge_profile(profile: dict, extracted: dict) -> dict:
     if not extracted:
         return profile
-    # Chief complaint
+
+    # simple merges
     if extracted.get("chief_complaint") and not profile.get("chief_complaint"):
         profile["chief_complaint"] = extracted["chief_complaint"]
-    # Demographics
+
     if isinstance(extracted.get("demographics"), dict):
         profile["demographics"] = {**profile.get("demographics", {}), **extracted["demographics"]}
-    # Medications
+
     if isinstance(extracted.get("medications"), list):
         seen = {(m.get("name"), m.get("dose"), m.get("route"), m.get("frequency")) for m in profile["medications"]}
         for m in extracted["medications"]:
             key = (m.get("name"), m.get("dose"), m.get("route"), m.get("frequency"))
             if key not in seen:
                 profile["medications"].append(m); seen.add(key)
-    # Allergies
+
     if isinstance(extracted.get("allergies"), list):
         seen = {(a.get("substance"), a.get("reaction")) for a in profile["allergies"]}
         for a in extracted["allergies"]:
             key = (a.get("substance"), a.get("reaction"))
             if key not in seen:
                 profile["allergies"].append(a); seen.add(key)
+
+    # PMH / FH / SH: accept strings or dicts
+    if extracted.get("past_medical_history"):
+        profile["past_medical_history"] = extracted["past_medical_history"]
+    if extracted.get("family_history"):
+        profile["family_history"] = extracted["family_history"]
+    if extracted.get("social_history"):
+        profile["social_history"] = extracted["social_history"]
+
     # Modules (symptom-specific blobs)
     if isinstance(extracted.get("modules"), dict):
         for mod, data in extracted["modules"].items():
             profile["modules"][mod] = {**profile["modules"].get(mod, {}), **data}
+
     # Free-text notes
     if isinstance(extracted.get("free_text_notes"), list):
         profile["free_text_notes"].extend(extracted["free_text_notes"])
+
+    # Red flag screening completion flag
+    if "red_flags_checked" in extracted:
+        profile["red_flags_checked"] = bool(extracted["red_flags_checked"])
+
     return profile
 
 def process_red_flags(new_flags):
-    if not new_flags: return
+    if not new_flags:
+        return
     for f in new_flags:
         if f not in st.session_state.profile["red_flags"]:
             st.session_state.profile["red_flags"].append(f)
@@ -142,7 +206,7 @@ def full_messages(user_text: str):
 
 def call_json(user_text: str):
     resp = client.chat.completions.create(
-        model="gpt-4o",  # use 4o for fidelity; swap to -mini if needed
+        model="gpt-4o",  # for fidelity; swap to -mini later if needed
         messages=full_messages(user_text),
         temperature=0.1,
         max_tokens=700,
@@ -182,16 +246,14 @@ TASK:
 - Use bullet points and medical clarity. No disclaimers.
 
 INPUTS:
-- Structured patient profile (JSON) with demographics, chief complaint, modules (symptom details), medications, allergies, red flags, and notes.
+- Structured patient profile (JSON) with demographics, chief complaint, modules (symptom details), medications, allergies, past medical history, family history, social history, red flags, and notes.
 - Conversation transcript (user/assistant turns). Use it only to clarify context; prefer structured data as source of truth.
 
 OUTPUT:
 Return plain markdown bullets — no preamble, no code fences.
 """
 
-def generate_clinician_summary_via_model(profile: dict, transcript: list[str]) -> str:
-    # Build a single prompt with profile + a compact transcript
-    # Keep transcript short-ish to control tokens
+def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) -> str:
     compact_transcript = []
     for m in transcript[-60:]:  # last 60 turns max
         role = m.get("role", "")
@@ -215,33 +277,25 @@ def generate_clinician_summary_via_model(profile: dict, transcript: list[str]) -
     )
     return resp.choices[0].message.content.strip()
 
-def clinician_summary_from_profile_only(profile: dict) -> str:
-    # Deterministic local fallback (no API) if you ever want it
-    cc = profile.get("chief_complaint")
-    demo = profile.get("demographics", {})
-    mods = profile.get("modules", {})
-    meds = profile.get("medications", [])
-    algs = profile.get("allergies", [])
-    rfs = profile.get("red_flags", [])
-    lines = []
-    lines.append("• Summary:")
-    bits = []
-    if demo.get("age_years"): bits.append(f'{demo["age_years"]}y')
-    if demo.get("sex"): bits.append(demo["sex"])
-    if cc: bits.append(f"CC: {cc}")
-    if bits: lines.append("  - " + ", ".join(bits))
-    for mod, data in mods.items():
-        show = []
-        for k in ["onset","duration","location","quality","severity_0_to_10","radiation","aggravating","relieving","associated"]:
-            if k in data: show.append(f"{k}={data[k]}")
-        if show: lines.append(f"  - {mod}: " + "; ".join(show))
-    if meds: lines.append("• Meds: " + "; ".join(f'{m.get("name","?")} {m.get("dose","")} {m.get("route","")} {m.get("frequency","")}'.strip() for m in meds))
-    if algs: lines.append("• Allergies: " + "; ".join(f'{a.get("substance","?")}→{a.get("reaction","?")}' for a in algs))
-    if rfs: lines.append("• ⚠️ Red flags: " + "; ".join(rfs))
-    lines.append("• Differentials: —")
-    lines.append("• Next steps: —")
-    lines.append("• First-line: —")
-    return "\n".join(lines)
+def finish_and_summarize():
+    """Emit final message, generate summary, and stop the app run."""
+    final_message = "Thank you for answering my questions. Your history is being forwarded to your doctor!"
+    st.session_state.messages.append({"role": "assistant", "content": final_message})
+    st.session_state.asked_questions.append(final_message)
+    try:
+        st.session_state.final_summary = generate_clinician_summary_via_model(
+            st.session_state.profile,
+            st.session_state.messages
+        )
+    except Exception:
+        st.session_state.final_summary = None
+    with st.sidebar:
+        st.header("Clinician summary (AI-generated)")
+        if st.session_state.final_summary:
+            st.markdown(st.session_state.final_summary)
+        else:
+            st.write("Summary unavailable. Try again from the sidebar.")
+    st.stop()
 
 # ─────────────────────────────────────────────
 # UI – transcript
@@ -268,11 +322,18 @@ if user_text:
     st.session_state.profile = merge_profile(st.session_state.profile, data.get("extracted_fields", {}))
     process_red_flags(data.get("red_flags", []))
 
-    # 4) next question or completion
+    # 4) deterministic stop checks BEFORE asking the next question
+    if history_complete(st.session_state.profile) or st.session_state.q_count >= MAX_QUESTIONS:
+        finish_and_summarize()
+
+    # 5) next question or completion (model-driven)
     next_q = (data.get("next_question") or "Please tell me more.").strip()
 
-    # 5) de-dupe (avoid repeating last assistant question)
-    last_assistant = next((m["content"].strip() for m in reversed(st.session_state.messages) if m["role"] == "assistant"), "")
+    # 6) de-dupe (avoid repeating last assistant question)
+    last_assistant = next(
+        (m["content"].strip() for m in reversed(st.session_state.messages) if m["role"] == "assistant"),
+        ""
+    )
     if last_assistant and next_q.lower() == last_assistant.lower():
         try:
             data2 = regenerate_advance(user_text, last_assistant)
@@ -282,31 +343,18 @@ if user_text:
         except Exception:
             next_q = "Thanks—please add one new detail."
 
-    # 6) if completion message, show it, generate clinician summary with GPT, and stop
+    # 7) if model announced completion, finish
     if next_q.lower().startswith("thank you for answering my questions"):
-        st.session_state.messages.append({"role": "assistant", "content": next_q})
-        st.session_state.asked_questions.append(next_q)
+        finish_and_summarize()
 
-        # Generate clinician summary via model (primary) with profile + transcript
-        try:
-            st.session_state.final_summary = generate_clinician_summary_via_model(
-                st.session_state.profile,
-                st.session_state.messages
-            )
-        except Exception:
-            # fallback to local summary if API hiccups
-            st.session_state.final_summary = clinician_summary_from_profile_only(st.session_state.profile)
-
-        # Render summary
-        with st.sidebar:
-            st.header("Clinician summary (AI-generated)")
-            st.markdown(st.session_state.final_summary)
-
-        st.stop()
-
-    # 7) otherwise continue the interview
+    # 8) otherwise continue the interview
     st.session_state.messages.append({"role": "assistant", "content": next_q})
     st.session_state.asked_questions.append(next_q)
+    st.session_state.q_count += 1  # count this assistant question
+    # If we just hit the cap, finish immediately on next rerun
+    if st.session_state.q_count >= MAX_QUESTIONS:
+        finish_and_summarize()
+
     st.rerun()
 
 # ─────────────────────────────────────────────
@@ -320,10 +368,10 @@ with st.sidebar:
                 st.session_state.profile,
                 st.session_state.messages
             )
+            st.markdown(st.session_state.final_summary)
         except Exception:
-            st.session_state.final_summary = clinician_summary_from_profile_only(st.session_state.profile)
-    if st.session_state.final_summary:
-        st.markdown(st.session_state.final_summary)
+            st.warning("Summary generation failed. Please try again.")
+    st.markdown(f"**Questions asked:** {st.session_state.q_count} / {MAX_QUESTIONS}")
 
     if st.button("Reset conversation"):
         st.session_state.messages = []
@@ -333,9 +381,14 @@ with st.sidebar:
             "modules": {},
             "medications": [],
             "allergies": [],
+            "past_medical_history": None,
+            "family_history": None,
+            "social_history": None,
             "red_flags": [],
+            "red_flags_checked": False,
             "free_text_notes": []
         }
         st.session_state.asked_questions = []
         st.session_state.final_summary = None
+        st.session_state.q_count = 0
         st.rerun()
