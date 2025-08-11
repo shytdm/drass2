@@ -16,19 +16,7 @@ client = OpenAI()
 
 # ─────────────────────────────────────────────
 # Session state
-# ─────────────────────────────────────────────
-
-# ── First-turn bootstrap (place BEFORE transcript rendering) ──
-if not st.session_state.messages:
-    st.session_state.messages.append(
-        {"role": "assistant", "content": "What brings you in today?"}
-    )
-
-# ── Transcript rendering ──
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.write(m["content"])
-        
+# ─────────────────────────────────────────────       
 if "messages" not in st.session_state:
     st.session_state.messages = []  # full chat transcript (compact messages)
 if "profile" not in st.session_state:
