@@ -1,4 +1,4 @@
-# clinical_assistant_demo.py — ChatGPT-style intake + deterministic stop + 30-question cap + AI summary
+# clinical_assistant_demo.py — Demographics form + ChatGPT-style intake + deterministic stop + 30Q cap + AI summary
 import json
 import streamlit as st
 from openai import OpenAI
@@ -19,16 +19,16 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "profile" not in st.session_state:
     st.session_state.profile = {
-        "demographics": {},           # {age_years, sex, etc.}
+        "demographics": {},           # {name, age_years, sex, ...}
         "chief_complaint": None,
         "modules": {},                # symptom-specific blobs (model-defined)
         "medications": [],            # [{name,dose,route,frequency}]
         "allergies": [],              # [{substance,reaction}]
-        "past_medical_history": None, # free text or structured dict
-        "family_history": None,       # free text or structured dict
-        "social_history": None,       # free text or structured dict
+        "past_medical_history": None, # str or dict
+        "family_history": None,       # str or dict
+        "social_history": None,       # str or dict
         "red_flags": [],              # collected silently
-        "red_flags_checked": False,   # model should set to true once screened
+        "red_flags_checked": False,   # set true once screened
         "free_text_notes": []
     }
 if "asked_questions" not in st.session_state:
@@ -36,11 +36,38 @@ if "asked_questions" not in st.session_state:
 if "final_summary" not in st.session_state:
     st.session_state.final_summary = None
 if "q_count" not in st.session_state:
-    st.session_state.q_count = 0  # assistant questions asked (excludes final thank-you)
+    st.session_state.q_count = 0  # assistant questions asked (excl. final thank-you)
 
-MAX_QUESTIONS = 30  # hard cap
+MAX_QUESTIONS = 30
 
-# Seed opening question BEFORE rendering
+# ─────────────────────────────────────────────
+# Static Demographics Form (above chat)
+# ─────────────────────────────────────────────
+with st.form("demographics_form", clear_on_submit=False):
+    st.subheader("Patient Demographics")
+    name = st.text_input("Full Name", value=st.session_state.profile["demographics"].get("name", ""))
+    age = st.number_input(
+        "Age (years)", min_value=0, max_value=120, step=1,
+        value=int(st.session_state.profile["demographics"].get("age_years") or 0)
+    )
+    sex = st.selectbox(
+        "Sex at Birth",
+        ["", "Male", "Female", "Intersex", "Prefer not to say"],
+        index=["", "Male", "Female", "Intersex", "Prefer not to say"].index(
+            st.session_state.profile["demographics"].get("sex", "")
+        )
+    )
+    submit_demo = st.form_submit_button("Save")
+
+    if submit_demo:
+        st.session_state.profile["demographics"]["name"] = name.strip() or None
+        st.session_state.profile["demographics"]["age_years"] = age if age > 0 else None
+        st.session_state.profile["demographics"]["sex"] = sex or None
+        st.success("Demographics saved.")
+
+# ─────────────────────────────────────────────
+# Seed opening question BEFORE transcript rendering
+# ─────────────────────────────────────────────
 if not st.session_state.messages:
     opening = "What brings you in today?"
     st.session_state.messages.append({"role": "assistant", "content": opening})
@@ -62,23 +89,17 @@ REQUIRED_SECTIONS = [
 ]
 
 def history_complete(profile: dict) -> bool:
-    # chief complaint present
     if not profile.get("chief_complaint"):
         return False
-    # demographics minimally populated
     demo = profile.get("demographics", {})
     if not (demo.get("age_years") or demo.get("sex")):
         return False
-    # PMH / FH / SH exist (allow non-empty strings or dicts)
     if not profile.get("past_medical_history"):
         return False
     if not profile.get("family_history"):
         return False
     if not profile.get("social_history"):
         return False
-    # meds & allergies can be empty lists, but we want them explicitly checked;
-    # require the keys exist (they do) — no extra condition here
-    # red flags checked boolean
     if not bool(profile.get("red_flags_checked")):
         return False
     return True
@@ -142,7 +163,6 @@ def merge_profile(profile: dict, extracted: dict) -> dict:
     if not extracted:
         return profile
 
-    # simple merges
     if extracted.get("chief_complaint") and not profile.get("chief_complaint"):
         profile["chief_complaint"] = extracted["chief_complaint"]
 
@@ -163,7 +183,6 @@ def merge_profile(profile: dict, extracted: dict) -> dict:
             if key not in seen:
                 profile["allergies"].append(a); seen.add(key)
 
-    # PMH / FH / SH: accept strings or dicts
     if extracted.get("past_medical_history"):
         profile["past_medical_history"] = extracted["past_medical_history"]
     if extracted.get("family_history"):
@@ -171,16 +190,13 @@ def merge_profile(profile: dict, extracted: dict) -> dict:
     if extracted.get("social_history"):
         profile["social_history"] = extracted["social_history"]
 
-    # Modules (symptom-specific blobs)
     if isinstance(extracted.get("modules"), dict):
         for mod, data in extracted["modules"].items():
             profile["modules"][mod] = {**profile["modules"].get(mod, {}), **data}
 
-    # Free-text notes
     if isinstance(extracted.get("free_text_notes"), list):
         profile["free_text_notes"].extend(extracted["free_text_notes"])
 
-    # Red flag screening completion flag
     if "red_flags_checked" in extracted:
         profile["red_flags_checked"] = bool(extracted["red_flags_checked"])
 
@@ -259,7 +275,7 @@ def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) 
         role = m.get("role", "")
         text = m.get("content", "")
         if role in ("user", "assistant"):
-            compact_transcript.append(f"{role.upper()}: {text}")
+            compact_transcript.append(f"{role.UPPER() if hasattr(role,'upper') else str(role).upper()}: {text}")
     transcript_text = "\n".join(compact_transcript)
 
     messages = [
@@ -350,8 +366,7 @@ if user_text:
     # 8) otherwise continue the interview
     st.session_state.messages.append({"role": "assistant", "content": next_q})
     st.session_state.asked_questions.append(next_q)
-    st.session_state.q_count += 1  # count this assistant question
-    # If we just hit the cap, finish immediately on next rerun
+    st.session_state.q_count += 1
     if st.session_state.q_count >= MAX_QUESTIONS:
         finish_and_summarize()
 
