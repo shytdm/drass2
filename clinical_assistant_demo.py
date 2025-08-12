@@ -1,4 +1,6 @@
-# clinical_assistant_demo.py — Demographics form + ChatGPT-style intake + deterministic stop + 30Q cap + AI summary
+# clinical_assistant_demo_v2.py — Demographics form + ChatGPT-style intake + deterministic finish + 30Q cap + AI summary
+# (Implements: finish flag, missing_fields, info_gain pressure, additive merges, de-dupe, red-flag checklist, progress panel)
+
 import json
 import streamlit as st
 from openai import OpenAI
@@ -7,10 +9,43 @@ from openai import OpenAI
 # Setup
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Clinical Intake (Demo)", layout="centered")
-st.title("🩺 Clinical Intake – Chat Demo")
+st.title("🩺 Clinical Intake – Chat Demo (v2)")
 st.caption("Prototype only. Not medical advice.")
 
 client = OpenAI()  # key already configured in your env/secrets
+
+# ─────────────────────────────────────────────
+# Constants & Checklists
+# ─────────────────────────────────────────────
+MAX_QUESTIONS = 30
+
+# Minimal red-flag checklist (extend as needed)
+RED_FLAG_CHECKLIST = {
+    "chest_pain": [
+        "exertional", "radiation", "dyspnea", "syncope", "diaphoresis", "risk_factors"
+    ],
+    "headache": [
+        "thunderclap", "neurologic_deficit", "neck_stiffness", "fever", "immunosuppression"
+    ],
+    "abdominal_pain": [
+        "rigidity", "rebound", "fever", "GI_bleed", "pregnancy", "jaundice"
+    ],
+    "sore_throat": [
+        "airway_compromise", "drooling", "trismus", "peritonsillar_abscess_signs", "dehydration"
+    ],
+    "shortness_of_breath": [
+        "hypoxia", "tachypnea", "chest_pain", "hemoptysis", "unilateral_leg_swelling"
+    ]
+}
+
+ROUTING_HINT = """
+Routing hint examples (do not repeat to user):
+- chest/pressure/tightness → capture chest pain details + red flags
+- headache → headache details + red flags
+- cough/fever/sore throat → URI details + red flags
+- abdominal pain → pain module + GI red flags
+- shortness of breath/dyspnea → dyspnea module + cardiorespiratory red flags
+"""
 
 # ─────────────────────────────────────────────
 # State
@@ -19,16 +54,16 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "profile" not in st.session_state:
     st.session_state.profile = {
-        "demographics": {},           # {name, age_years, sex, ...}
+        "demographics": {},            # {name, age_years, sex, ...}
         "chief_complaint": None,
-        "modules": {},                # symptom-specific blobs (model-defined)
-        "medications": [],            # [{name,dose,route,frequency}]
-        "allergies": [],              # [{substance,reaction}]
-        "past_medical_history": None, # str or dict
-        "family_history": None,       # str or dict
-        "social_history": None,       # str or dict
-        "red_flags": [],              # collected silently
-        "red_flags_checked": False,   # set true once screened
+        "modules": {},                 # symptom-specific blobs (model-defined)
+        "medications": [],             # [{name,dose,route,frequency}]
+        "allergies": [],               # [{substance,reaction}]
+        "past_medical_history": {},    # dict; additive
+        "family_history": {},          # dict; additive
+        "social_history": {},          # dict; additive
+        "red_flags": [],               # collected silently
+        "red_flags_checked": False,    # set true once screened
         "free_text_notes": []
     }
 if "asked_questions" not in st.session_state:
@@ -37,8 +72,8 @@ if "final_summary" not in st.session_state:
     st.session_state.final_summary = None
 if "q_count" not in st.session_state:
     st.session_state.q_count = 0  # assistant questions asked (excl. final thank-you)
-
-MAX_QUESTIONS = 30
+if "missing_fields_latest" not in st.session_state:
+    st.session_state.missing_fields_latest = []
 
 # ─────────────────────────────────────────────
 # Static Demographics Form (above chat)
@@ -75,132 +110,134 @@ if not st.session_state.messages:
     st.session_state.q_count = 1
 
 # ─────────────────────────────────────────────
-# Deterministic stop rules
+# System prompt (history taking with finish gating)
 # ─────────────────────────────────────────────
-REQUIRED_SECTIONS = [
-    "chief_complaint",
-    "demographics",
-    "past_medical_history",
-    "medications",
-    "allergies",
-    "family_history",
-    "social_history",
-    "red_flags_checked",
-]
-
-def history_complete(profile: dict) -> bool:
-    if not profile.get("chief_complaint"):
-        return False
-    demo = profile.get("demographics", {})
-    if not (demo.get("age_years") or demo.get("sex")):
-        return False
-    if not profile.get("past_medical_history"):
-        return False
-    if not profile.get("family_history"):
-        return False
-    if not profile.get("social_history"):
-        return False
-    if not bool(profile.get("red_flags_checked")):
-        return False
-    return True
-
-# ─────────────────────────────────────────────
-# System prompt (history taking & stop signal for the MODEL)
-# ─────────────────────────────────────────────
-SYSTEM = """
+SYSTEM = f"""
 You are a clinical intake assistant for a primary care clinic.
 
-Your task each session:
-- Take a complete medical history for the patient's presenting complaint.
-- Check all relevant red flags for that complaint.
-- Gather essentials: past medical history, medications, allergies, family history, social history.
-- Clarify anything unclear.
-- Ask short, specific questions, ONE at a time.
-- NEVER give medical advice. NEVER tell the patient about red flags or urgency. Red flags go ONLY in the JSON `red_flags` array for the doctor's note.
+GOAL
+- Get a complete, decision-useful history with the FEWEST questions.
+- Ask ONE short, specific question per turn.
+- NEVER give medical advice. NEVER reveal red flags to patient.
+- Prefer structured facts over prose. Do not repeat already-answered or explicitly-unknown items.
 
-IMPORTANT:
-- Set `red_flags_checked` to true in `extracted_fields` once you have screened red flags relevant to the complaint.
-- Always parse any new info into `extracted_fields` so the app can track completion.
-- Do NOT repeat the last assistant question verbatim. If clarifying, rephrase and advance.
+SLOT MODEL (fill these if applicable)
+Required core slots:
+- chief_complaint (string)
+- demographics.age_years (int), demographics.sex (string)
+- past_medical_history (dict)
+- medications (list of {{name,dose,route,frequency}})
+- allergies (list of {{substance,reaction}})
+- family_history (dict)
+- social_history (dict: tobacco/alcohol/drugs/occupation/living)
+- red_flags_checked (boolean)
+Symptom modules (only if relevant to CC), e.g.:
+- pain: {{location, quality, severity_0_to_10, onset, duration:{{value,unit}}, radiation, aggravating, relieving, associated}}
 
-When you have enough information to form a proper differential diagnosis and a concise history, STOP asking questions and output:
+RED FLAG POLICY
+- For common complaints (chest pain, SOB, headache, abdominal pain, fever/URI), you MUST complete a standard checklist before setting red_flags_checked=true.
+- Use this checklist map (JSON): {json.dumps(RED_FLAG_CHECKLIST, ensure_ascii=False)}
+- Put red flag observations ONLY in `red_flags` array.
 
-{
-  "next_question": "Thank you for answering my questions. Your history is being forwarded to your doctor!",
-  "extracted_fields": { ... final structured history ... },
-  "red_flags": [ ... ],
-  "rationale": "History completed"
-}
+STOP CRITERIA (strict)
+- Compute `missing_fields`: slots still empty that would change DDx or immediate next steps.
+- Estimate `info_gain_estimate` in [0,1] for the NEXT question.
+- If `missing_fields` is empty OR `info_gain_estimate < 0.15`, set `finish=true`.
+- Otherwise `finish=false` and ask exactly ONE new question targeting the highest-yield missing slot(s).
 
-Each turn, reply with ONLY strict JSON (no backticks, no extra prose) with keys:
-- next_question: string  # the single next question OR the final thank-you line
-- extracted_fields: object  # structured data parsed from the patient's last answer (mergeable)
-- red_flags: string[]  # any detected red flags (for clinician only)
-- rationale: string    # short reason for your next question/finish
+DE-DUPE
+- Use provided ASKED_QUESTIONS to avoid repeats. If a slot is answered or marked unknown, never ask it again. Track that in `missing_fields_ignored`.
+
+BUDGET
+- You have a remaining question budget. Ask only if the answer is likely to change DDx or immediate plan.
+
+OUTPUT FORMAT — STRICT JSON ONLY (no prose):
+{{
+  "next_question": "string (or final thank-you line if finish=true)",
+  "finish": true|false,
+  "extracted_fields": {{...mergeable structured data...}},
+  "red_flags": ["..."],
+  "missing_fields": ["slot.path", "..."],
+  "missing_fields_ignored": ["slot.path", "..."],
+  "target_slots": ["slot.path", "..."],
+  "info_gain_estimate": 0.0,
+  "rationale": "≤15 words about why this question or finish"
+}}
 
 Normalization:
 - Dates → ISO yyyy-mm-dd when possible (approx allowed: "~2025-08-01")
-- Durations → {value:int, unit:"days|weeks|months|years"}
+- Durations → {{value:int, unit:"days|weeks|months|years"}}
 - Yes/No → true/false
-- Medications → [{name, dose, route, frequency}]
-- Allergies → [{substance, reaction}]
-- Pain → {location, quality, severity_0_to_10, onset, duration, radiation, aggravating, relieving, associated}
+- Medications → [{{name, dose, route, frequency}}]
+- Allergies → [{{substance, reaction}}]
+- Pain → {{location, quality, severity_0_to_10, onset, duration, radiation, aggravating, relieving, associated}}
 
 Output ONLY the JSON object. Nothing else.
 """
 
-ROUTING_HINT = """
-Routing hint examples (do not repeat to user):
-- chest/pressure/tightness → capture chest pain details + red flags
-- headache → headache details + red flags
-- cough/fever/sore throat → URI details + red flags
-"""
+# ─────────────────────────────────────────────
+# Helpers — merging & red flags
+# ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
+def _merge_dict(dst: dict, src: dict):
+    for k, v in (src or {}).items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _merge_dict(dst[k], v)
+        else:
+            dst[k] = v
+
 def merge_profile(profile: dict, extracted: dict) -> dict:
     if not extracted:
         return profile
 
+    # chief complaint once
     if extracted.get("chief_complaint") and not profile.get("chief_complaint"):
         profile["chief_complaint"] = extracted["chief_complaint"]
 
+    # demographics
     if isinstance(extracted.get("demographics"), dict):
-        profile["demographics"] = {**profile.get("demographics", {}), **extracted["demographics"]}
+        _merge_dict(profile.setdefault("demographics", {}), extracted["demographics"])
 
+    # medications (set-like)
     if isinstance(extracted.get("medications"), list):
         seen = {(m.get("name"), m.get("dose"), m.get("route"), m.get("frequency")) for m in profile["medications"]}
         for m in extracted["medications"]:
             key = (m.get("name"), m.get("dose"), m.get("route"), m.get("frequency"))
             if key not in seen:
-                profile["medications"].append(m); seen.add(key)
+                profile["medications"].append(m)
+                seen.add(key)
 
+    # allergies (set-like)
     if isinstance(extracted.get("allergies"), list):
         seen = {(a.get("substance"), a.get("reaction")) for a in profile["allergies"]}
         for a in extracted["allergies"]:
             key = (a.get("substance"), a.get("reaction"))
             if key not in seen:
-                profile["allergies"].append(a); seen.add(key)
+                profile["allergies"].append(a)
+                seen.add(key)
 
-    if extracted.get("past_medical_history"):
-        profile["past_medical_history"] = extracted["past_medical_history"]
-    if extracted.get("family_history"):
-        profile["family_history"] = extracted["family_history"]
-    if extracted.get("social_history"):
-        profile["social_history"] = extracted["social_history"]
+    # dict merges for histories
+    for k in ["past_medical_history", "family_history", "social_history"]:
+        if isinstance(extracted.get(k), dict):
+            _merge_dict(profile.setdefault(k, {}), extracted[k])
+        elif extracted.get(k):  # string or other
+            profile[k] = extracted[k]
 
+    # modules
     if isinstance(extracted.get("modules"), dict):
         for mod, data in extracted["modules"].items():
-            profile["modules"][mod] = {**profile["modules"].get(mod, {}), **data}
+            _merge_dict(profile.setdefault("modules", {}).setdefault(mod, {}), data)
 
+    # notes
     if isinstance(extracted.get("free_text_notes"), list):
         profile["free_text_notes"].extend(extracted["free_text_notes"])
 
+    # red-flag gate
     if "red_flags_checked" in extracted:
         profile["red_flags_checked"] = bool(extracted["red_flags_checked"])
 
     return profile
+
 
 def process_red_flags(new_flags):
     if not new_flags:
@@ -209,47 +246,124 @@ def process_red_flags(new_flags):
         if f not in st.session_state.profile["red_flags"]:
             st.session_state.profile["red_flags"].append(f)
 
+
 def full_messages(user_text: str):
+    # Question budget hint
+    remaining_budget = max(0, MAX_QUESTIONS - st.session_state.q_count)
     msgs = [
         {"role": "system", "content": SYSTEM},
         {"role": "system", "content": f"PROFILE:{json.dumps(st.session_state.profile, ensure_ascii=False)}"},
         {"role": "system", "content": f"ASKED_QUESTIONS:{json.dumps(st.session_state.asked_questions[-50:], ensure_ascii=False)}"},
+        {"role": "system", "content": f"QUESTION_BUDGET:{remaining_budget}"},
         {"role": "system", "content": ROUTING_HINT.strip()},
     ]
     msgs.extend(st.session_state.messages)  # ENTIRE transcript
     msgs.append({"role": "user", "content": user_text})
     return msgs
 
+
+def _response_format_json_object():
+    # Portable default; if your runtime supports json_schema, you can swap it in below.
+    return {"type": "json_object"}
+
+
+def _response_format_json_schema():
+    # If supported by your SDK/runtime, this constrains output better.
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "intake_step",
+            "schema": {
+                "type": "object",
+                "required": [
+                    "next_question", "finish", "extracted_fields", "red_flags",
+                    "missing_fields", "target_slots", "info_gain_estimate", "rationale"
+                ],
+                "properties": {
+                    "next_question": {"type": "string"},
+                    "finish": {"type": "boolean"},
+                    "extracted_fields": {"type": "object"},
+                    "red_flags": {"type": "array", "items": {"type": "string"}},
+                    "missing_fields": {"type": "array", "items": {"type": "string"}},
+                    "missing_fields_ignored": {"type": "array", "items": {"type": "string"}},
+                    "target_slots": {"type": "array", "items": {"type": "string"}},
+                    "info_gain_estimate": {"type": "number", "minimum": 0, "maximum": 1},
+                    "rationale": {"type": "string", "maxLength": 120}
+                },
+                "additionalProperties": True
+            }
+        }
+    }
+
+
+USE_JSON_SCHEMA = False  # set True if your SDK supports response_format json_schema
+
+
 def call_json(user_text: str):
+    rf = _response_format_json_schema() if USE_JSON_SCHEMA else _response_format_json_object()
     resp = client.chat.completions.create(
         model="gpt-4o",  # for fidelity; swap to -mini later if needed
         messages=full_messages(user_text),
         temperature=0.1,
         max_tokens=700,
-        response_format={"type": "json_object"},
+        response_format=rf,
     )
     raw = resp.choices[0].message.content
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except Exception:
         return {
             "next_question": "Sorry, I didn’t catch that. Could you rephrase?",
+            "finish": False,
             "extracted_fields": {},
             "red_flags": ["parse_error"],
+            "missing_fields": [],
+            "missing_fields_ignored": [],
+            "target_slots": [],
+            "info_gain_estimate": 0.0,
             "rationale": "Non-JSON; safety fallback."
         }
 
+    # Soft validation & defaults
+    data.setdefault("finish", False)
+    data.setdefault("extracted_fields", {})
+    data.setdefault("red_flags", [])
+    data.setdefault("missing_fields", [])
+    data.setdefault("missing_fields_ignored", [])
+    data.setdefault("target_slots", [])
+    data.setdefault("info_gain_estimate", 0.0)
+    data.setdefault("rationale", "")
+    data.setdefault("next_question", "Please tell me more.")
+    return data
+
+
 def regenerate_advance(user_text: str, avoid_q: str):
     msgs = full_messages(user_text)
-    msgs.append({"role":"user","content":f"[META] Do NOT repeat: {avoid_q}. Ask a different, advancing question."})
+    msgs.append({"role": "user", "content": f"[META] Do NOT repeat: {avoid_q}. Ask a different, advancing question."})
+    rf = _response_format_json_schema() if USE_JSON_SCHEMA else _response_format_json_object()
     resp = client.chat.completions.create(
         model="gpt-4o",
         messages=msgs,
         temperature=0.1,
         max_tokens=700,
-        response_format={"type":"json_object"},
+        response_format=rf,
     )
-    return json.loads(resp.choices[0].message.content)
+    content = resp.choices[0].message.content
+    try:
+        return json.loads(content)
+    except Exception:
+        return {
+            "next_question": "Thanks — please add one new detail.",
+            "finish": False,
+            "extracted_fields": {},
+            "red_flags": [],
+            "missing_fields": [],
+            "missing_fields_ignored": [],
+            "target_slots": [],
+            "info_gain_estimate": 0.0,
+            "rationale": "Non-JSON fallback"
+        }
+
 
 # ---- Clinician Summary via ChatGPT ------------------------------------------
 SUMMARY_TASK = """You are assisting a clinician.
@@ -269,13 +383,14 @@ OUTPUT:
 Return plain markdown bullets — no preamble, no code fences.
 """
 
+
 def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) -> str:
     compact_transcript = []
     for m in transcript[-60:]:  # last 60 turns max
         role = m.get("role", "")
         text = m.get("content", "")
         if role in ("user", "assistant"):
-            compact_transcript.append(f"{role.UPPER() if hasattr(role,'upper') else str(role).upper()}: {text}")
+            compact_transcript.append(f"{str(role).upper()}: {text}")
     transcript_text = "\n".join(compact_transcript)
 
     messages = [
@@ -293,9 +408,10 @@ def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) 
     )
     return resp.choices[0].message.content.strip()
 
-def finish_and_summarize():
+
+def finish_and_summarize(final_line: str | None = None):
     """Emit final message, generate summary, and stop the app run."""
-    final_message = "Thank you for answering my questions. Your history is being forwarded to your doctor!"
+    final_message = final_line or "Thank you for answering my questions. Your history is being forwarded to your doctor!"
     st.session_state.messages.append({"role": "assistant", "content": final_message})
     st.session_state.asked_questions.append(final_message)
     try:
@@ -338,14 +454,13 @@ if user_text:
     st.session_state.profile = merge_profile(st.session_state.profile, data.get("extracted_fields", {}))
     process_red_flags(data.get("red_flags", []))
 
-    # 4) deterministic stop checks BEFORE asking the next question
-    if history_complete(st.session_state.profile) or st.session_state.q_count >= MAX_QUESTIONS:
-        finish_and_summarize()
-
-    # 5) next question or completion (model-driven)
+    # 4) derive next question and model finish decision
+    model_finish = bool(data.get("finish", False))
+    missing_fields = data.get("missing_fields", [])
+    st.session_state.missing_fields_latest = missing_fields
     next_q = (data.get("next_question") or "Please tell me more.").strip()
 
-    # 6) de-dupe (avoid repeating last assistant question)
+    # 5) de-dupe (avoid repeating last assistant question)
     last_assistant = next(
         (m["content"].strip() for m in reversed(st.session_state.messages) if m["role"] == "assistant"),
         ""
@@ -355,25 +470,33 @@ if user_text:
             data2 = regenerate_advance(user_text, last_assistant)
             st.session_state.profile = merge_profile(st.session_state.profile, data2.get("extracted_fields", {}))
             process_red_flags(data2.get("red_flags", []))
-            next_q = (data2.get("next_question") or "Thanks—please add one new detail.").strip()
+            next_q = (data2.get("next_question") or "Thanks — please add one new detail.").strip()
+            model_finish = bool(data2.get("finish", model_finish))
+            st.session_state.missing_fields_latest = data2.get("missing_fields", missing_fields)
         except Exception:
-            next_q = "Thanks—please add one new detail."
+            next_q = "Thanks — please add one new detail."
 
-    # 7) if model announced completion, finish
-    if next_q.lower().startswith("thank you for answering my questions"):
-        finish_and_summarize()
+    # 6) if model announced completion or we hit the cap, finish
+    if model_finish or st.session_state.q_count >= MAX_QUESTIONS:
+        if next_q.lower().startswith("thank you for answering my questions"):
+            # use model's final line if provided
+            finish_and_summarize(final_line=next_q)
+        else:
+            finish_and_summarize()
 
-    # 8) otherwise continue the interview
+    # 7) otherwise continue the interview
     st.session_state.messages.append({"role": "assistant", "content": next_q})
     st.session_state.asked_questions.append(next_q)
     st.session_state.q_count += 1
+
+    # 8) hard stop if we just reached the cap
     if st.session_state.q_count >= MAX_QUESTIONS:
         finish_and_summarize()
 
     st.rerun()
 
 # ─────────────────────────────────────────────
-# Sidebar – actions
+# Sidebar – actions & progress
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("Actions")
@@ -386,7 +509,11 @@ with st.sidebar:
             st.markdown(st.session_state.final_summary)
         except Exception:
             st.warning("Summary generation failed. Please try again.")
+
     st.markdown(f"**Questions asked:** {st.session_state.q_count} / {MAX_QUESTIONS}")
+
+    st.header("Progress")
+    st.json({"missing_fields_latest": st.session_state.missing_fields_latest}, expanded=False)
 
     if st.button("Reset conversation"):
         st.session_state.messages = []
@@ -396,9 +523,9 @@ with st.sidebar:
             "modules": {},
             "medications": [],
             "allergies": [],
-            "past_medical_history": None,
-            "family_history": None,
-            "social_history": None,
+            "past_medical_history": {},
+            "family_history": {},
+            "social_history": {},
             "red_flags": [],
             "red_flags_checked": False,
             "free_text_notes": []
@@ -406,4 +533,5 @@ with st.sidebar:
         st.session_state.asked_questions = []
         st.session_state.final_summary = None
         st.session_state.q_count = 0
+        st.session_state.missing_fields_latest = []
         st.rerun()
