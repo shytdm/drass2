@@ -275,7 +275,7 @@ def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) 
         role = m.get("role", "")
         text = m.get("content", "")
         if role in ("user", "assistant"):
-            compact_transcript.append(f"{role.UPPER() if hasattr(role,'upper') else str(role).upper()}: {text}")
+            compact_transcript.append(f"{role.upper() if hasattr(role,'upper') else str(role).upper()}: {text}")
     transcript_text = "\n".join(compact_transcript)
 
     messages = [
