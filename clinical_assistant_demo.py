@@ -551,7 +551,7 @@ with st.sidebar:
             link = make_patient_link(did)
             st.write("**Patient intake link** (share or print as QR):")
             st.code(link)
-            st.image(_make_qr_png(link), caption="Scan to start patient intake", use_column_width=False)
+            st.image(_make_qr_png(link), caption="Scan to start patient intake", use_container_width=False)
 
             st.subheader("Incoming Summaries")
             inbox = ensure_inbox(did)
