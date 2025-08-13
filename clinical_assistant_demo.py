@@ -131,12 +131,22 @@ def run_patient_mode_header(doctor_id: str):
     st.info(f"Submitting this intake to **{name}**.")
 
 # ─────────────────────────────────────────────
-# URL mode detection (NEW)
-# ─────────────────────────────────────────────
-qp = st.experimental_get_query_params()
-APP_MODE = (qp.get("mode", [""])[0] or "").lower()
-DOCTOR_ID = qp.get("doc", [""])[0] or None
+# New API (Streamlit ≥1.32) with backward compatibility
+try:
+    qp = st.query_params               # dict-like, values are strings
+    _is_new_qp = True
+except Exception:
+    qp = st.experimental_get_query_params()  # dict[str, list[str]]
+    _is_new_qp = False
 
+def _qp_get(key: str, default: str = "") -> str:
+    if _is_new_qp:
+        return (qp.get(key) or default)
+    # old API returns lists
+    return (qp.get(key, [default])[0] or default)
+
+APP_MODE  = _qp_get("mode").lower()
+DOCTOR_ID = _qp_get("doc") or None
 # ─────────────────────────────────────────────
 # State
 # ─────────────────────────────────────────────
