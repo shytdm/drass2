@@ -1,7 +1,15 @@
-# clinical_assistant_demo.py — Demographics form + ChatGPT-style intake + deterministic stop + 30Q cap + AI summary
+# clinical_assistant_demo.py — Demographics form + ChatGPT-style intake + deterministic stop + 30Q cap + AI summary + Doctor-linked QR intake + Doctor dashboard
 import json
+import time
+import io
+import uuid
+import hashlib
+import hmac
+from urllib.parse import urlencode
+
 import streamlit as st
 from openai import OpenAI
+import qrcode
 
 # ─────────────────────────────────────────────
 # Setup
@@ -11,6 +19,123 @@ st.title("🩺 Clinical Intake – Chat Demo")
 st.caption("Prototype only. Not medical advice.")
 
 client = OpenAI()  # key already configured in your env/secrets
+
+# ─────────────────────────────────────────────
+# Auth + Doctor registry + Inbox (NEW)
+# ─────────────────────────────────────────────
+# Secrets structure expected (example):
+# [auth]
+# app_base_url = "https://your-app.streamlit.app"
+# salt = "change-this-salt"
+# [[auth.users]]
+# username = "clinician"
+# password_sha256 = "<sha256(password+salt)>"
+# display_name = "Dr. Smith"
+AUTH = st.secrets.get("auth", {})
+APP_BASE_URL = (AUTH.get("app_base_url") or "http://localhost:8501").rstrip("/")
+AUTH_SALT = AUTH.get("salt", "change-this-salt")
+USERS = AUTH.get("users", [])
+
+def _sha256(pw: str, salt: str) -> str:
+    return hashlib.sha256((pw + salt).encode("utf-8")).hexdigest()
+
+def _verify_pw(username: str, password: str):
+    for u in USERS:
+        if u.get("username") == username:
+            expected = u.get("password_sha256", "")
+            got = _sha256(password, AUTH_SALT)
+            if hmac.compare_digest(expected, got):
+                return {"username": username, "display_name": u.get("display_name", username)}
+    # Fallback demo user if no secrets configured
+    if not USERS and username == "demo" and password == "demo":
+        return {"username": "demo", "display_name": "Demo Doctor"}
+    return None
+
+def require_login():
+    if st.session_state.get("auth_user"):
+        return st.session_state["auth_user"]
+    st.header("🔐 Doctor Login")
+    with st.form("login_form"):
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Sign in")
+    if ok:
+        user = _verify_pw(u, p)
+        if user:
+            st.session_state["auth_user"] = user
+            st.success(f"Welcome, {user['display_name']}!")
+            st.rerun()
+        else:
+            st.error("Invalid credentials.")
+    st.stop()
+
+@st.cache_resource
+def doctor_store():
+    # Map a stable doctor_id to each configured user
+    # doctor_id -> {username, display_name}
+    store = {}
+    if USERS:
+        for u in USERS:
+            did = f"doc_{u['username']}"
+            store[did] = {"username": u["username"], "display_name": u.get("display_name", u["username"])}
+    else:
+        # Demo fallback
+        store["doc_demo"] = {"username": "demo", "display_name": "Demo Doctor"}
+    return store
+
+@st.cache_resource
+def inbox_store():
+    # doctor_id -> list of encounters
+    return {}
+
+def ensure_inbox(doctor_id: str):
+    inbox = inbox_store()
+    inbox.setdefault(doctor_id, [])
+    return inbox[doctor_id]
+
+def save_encounter(doctor_id: str, profile: dict, summary_md: str):
+    enc = {
+        "encounter_id": uuid.uuid4().hex,
+        "created_ts": int(time.time()),
+        "profile": profile,
+        "summary_md": summary_md
+    }
+    ensure_inbox(doctor_id).append(enc)
+    return enc["encounter_id"]
+
+def doctor_id_for_user(user) -> str | None:
+    uname = user.get("username") if user else None
+    for did, meta in doctor_store().items():
+        if meta["username"] == uname:
+            return did
+    return None
+
+def make_patient_link(doctor_id: str) -> str:
+    params = urlencode({"mode": "patient", "doc": doctor_id})
+    return f"{APP_BASE_URL}/?{params}"
+
+def _make_qr_png(data_url: str):
+    qr = qrcode.QRCode(box_size=6, border=2)
+    qr.add_data(data_url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+def run_patient_mode_header(doctor_id: str):
+    d = doctor_store().get(doctor_id)
+    st.session_state.setdefault("encounter_doctor_id", doctor_id)
+    name = (d["display_name"] if d else doctor_id)
+    st.info(f"Submitting this intake to **{name}**.")
+
+# ─────────────────────────────────────────────
+# URL mode detection (NEW)
+# ─────────────────────────────────────────────
+qp = st.experimental_get_query_params()
+APP_MODE = (qp.get("mode", [""])[0] or "").lower()
+DOCTOR_ID = qp.get("doc", [""])[0] or None
 
 # ─────────────────────────────────────────────
 # State
@@ -39,6 +164,21 @@ if "q_count" not in st.session_state:
     st.session_state.q_count = 0  # assistant questions asked (excl. final thank-you)
 
 MAX_QUESTIONS = 30
+
+# ─────────────────────────────────────────────
+# Patient vs Doctor entry (NEW)
+# ─────────────────────────────────────────────
+if APP_MODE == "patient":
+    # Validate doctor id in link
+    if not DOCTOR_ID or DOCTOR_ID not in doctor_store():
+        st.error("Invalid or missing doctor code. Please request a fresh QR/link from your clinic.")
+        st.stop()
+    run_patient_mode_header(DOCTOR_ID)
+else:
+    # Doctor dashboard requires login
+    user = require_login()
+    st.sidebar.success(f"Signed in as: {user['display_name']}")
+    CURRENT_DOC_ID = doctor_id_for_user(user)
 
 # ─────────────────────────────────────────────
 # Static Demographics Form (above chat)
@@ -301,7 +441,7 @@ def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) 
     return resp.choices[0].message.content.strip()
 
 def finish_and_summarize():
-    """Emit final message, generate summary, and stop the app run."""
+    """Emit final message, generate summary, save to doctor (if in patient mode), and stop the app run."""
     final_message = "Thank you for answering my questions. Your history is being forwarded to your doctor!"
     st.session_state.messages.append({"role": "assistant", "content": final_message})
     st.session_state.asked_questions.append(final_message)
@@ -312,6 +452,15 @@ def finish_and_summarize():
         )
     except Exception:
         st.session_state.final_summary = None
+
+    # NEW: If patient mode, save to the doctor’s inbox
+    if st.session_state.get("encounter_doctor_id") and st.session_state.final_summary:
+        save_encounter(
+            st.session_state["encounter_doctor_id"],
+            st.session_state.profile,
+            st.session_state.final_summary
+        )
+
     with st.sidebar:
         st.header("Clinician summary (AI-generated)")
         if st.session_state.final_summary:
@@ -380,9 +529,35 @@ if user_text:
     st.rerun()
 
 # ─────────────────────────────────────────────
-# Sidebar – actions
+# Sidebar – actions + DOCTOR DASHBOARD (NEW)
 # ─────────────────────────────────────────────
 with st.sidebar:
+    if APP_MODE != "patient":
+        st.header("Doctor Dashboard")
+        did = doctor_id_for_user(st.session_state.get("auth_user", {}))
+        if not did:
+            st.warning("No doctor profile linked to this user.")
+        else:
+            link = make_patient_link(did)
+            st.write("**Patient intake link** (share or print as QR):")
+            st.code(link)
+            st.image(_make_qr_png(link), caption="Scan to start patient intake", use_column_width=False)
+
+            st.subheader("Incoming Summaries")
+            inbox = ensure_inbox(did)
+            if not inbox:
+                st.write("No submissions yet.")
+            else:
+                # newest first
+                for enc in sorted(inbox, key=lambda e: e["created_ts"], reverse=True):
+                    ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(enc["created_ts"]))
+                    st.markdown(f"**Encounter:** `{enc['encounter_id']}` — {ts}")
+                    with st.expander("Structured profile"):
+                        st.json(enc["profile"])
+                    with st.expander("Summary"):
+                        st.markdown(enc["summary_md"])
+                    st.write("---")
+
     st.header("Actions")
     if st.button("Generate clinician summary now"):
         try:
@@ -413,4 +588,5 @@ with st.sidebar:
         st.session_state.asked_questions = []
         st.session_state.final_summary = None
         st.session_state.q_count = 0
+        # preserve encounter_doctor_id so patient can restart without losing routing
         st.rerun()
