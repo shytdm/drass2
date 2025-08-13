@@ -252,14 +252,21 @@ def regenerate_advance(user_text: str, avoid_q: str):
     return json.loads(resp.choices[0].message.content)
 
 # ---- Clinician Summary via ChatGPT ------------------------------------------
-SUMMARY_TASK = """You are assisting a clinician.
+SUMMARY_TASK = """
+You are assisting a clinician.
 
 TASK:
-- Write a concise clinical summary (max 150 words)
-- Highlight red flags
-- Give 2–4 differential diagnoses
-- Recommend next steps and first-line treatment
-- Use bullet points and medical clarity. No disclaimers.
+- Write a concise clinical summary (max 150 words).
+- Highlight red flags.
+- Provide up to 4 differential diagnoses ranked from most to least likely.
+- For the most likely differential, list the key history or exam findings that support it.
+- Recommend next steps and first-line treatment.
+- For each recommended diagnostic test, briefly explain the clinical rationale (what you are trying to confirm or rule out).
+- Under 'Consult Suggestions', include:
+  - Key questions to ask the patient (state why each is important and what it would help determine).
+  - Key examinations to perform (state why each is important and what findings would indicate).
+- Use bullet points, ranked lists, and concise medical clarity. 
+- No disclaimers.
 
 INPUTS:
 - Structured patient profile (JSON) with demographics, chief complaint, modules (symptom details), medications, allergies, past medical history, family history, social history, red flags, and notes.
