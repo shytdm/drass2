@@ -25,7 +25,7 @@ st.set_page_config(page_title="Clinical Intake (Demo)", layout="centered")
 client = OpenAI()  # key already configured in your env/secrets
 
 # ─────────────────────────────────────────────
-# Simple auth (demo/demo fallback) + doctor registry + inbox (in-memory demo)
+# Auth + doctor registry + inbox
 # ─────────────────────────────────────────────
 AUTH = st.secrets.get("auth", {})
 APP_BASE_URL = (AUTH.get("app_base_url") or "").rstrip("/")
@@ -42,14 +42,12 @@ def _sha256(pw: str, salt: str) -> str:
     return hashlib.sha256((pw + salt).encode("utf-8")).hexdigest()
 
 def _verify_pw(username: str, password: str):
-    # If users configured in secrets, use salted hash
     for u in USERS:
         if u.get("username") == username:
             expected = str(u.get("password_sha256", "")).strip()
             got = _sha256(password, AUTH_SALT)
             if hmac.compare_digest(expected, got):
                 return {"username": username, "display_name": u.get("display_name", username)}
-    # Demo fallback when no users configured
     if not USERS and username == "demo" and password == "demo":
         return {"username": "demo", "display_name": "Demo Doctor"}
     return None
@@ -75,7 +73,6 @@ def require_login():
 
 @st.cache_resource
 def doctor_store():
-    # doctor_id -> {username, display_name} ; fixed for demo
     store = {}
     if USERS:
         for u in USERS:
@@ -87,7 +84,6 @@ def doctor_store():
 
 @st.cache_resource
 def inbox_store():
-    # doctor_id -> list of encounters
     return {}
 
 def ensure_inbox(doctor_id: str):
@@ -130,10 +126,10 @@ def _make_qr_png(data_url: str):
     return buf
 
 # ─────────────────────────────────────────────
-# URL params (new API with fallback) — hardened getter
+# URL params
 # ─────────────────────────────────────────────
 try:
-    qp = st.query_params  # Streamlit ≥ 1.32 returns dict-like
+    qp = st.query_params  # Streamlit ≥1.32
     _new_qp = True
 except Exception:
     qp = st.experimental_get_query_params()
@@ -149,7 +145,7 @@ APP_MODE  = (_qp_get("mode") or "").lower()
 DOCTOR_ID = _qp_get("doc") or None
 
 # ─────────────────────────────────────────────
-# Patient interview state
+# Patient state
 # ─────────────────────────────────────────────
 def init_patient_state():
     if "messages" not in st.session_state:
@@ -177,9 +173,6 @@ def init_patient_state():
 
 MAX_QUESTIONS = 30
 
-# ─────────────────────────────────────────────
-# Deterministic stop rules (unchanged)
-# ─────────────────────────────────────────────
 def history_complete(profile: dict) -> bool:
     if not profile.get("chief_complaint"):
         return False
@@ -197,7 +190,7 @@ def history_complete(profile: dict) -> bool:
     return True
 
 # ─────────────────────────────────────────────
-# System prompts (unchanged)
+# System prompts
 # ─────────────────────────────────────────────
 SYSTEM = """
 You are a clinical intake assistant for a primary care clinic.
@@ -243,5 +236,30 @@ Output ONLY the JSON object. Nothing else.
 
 ROUTING_HINT = """
 Routing hint examples (do not repeat to user):
-- chest/pressure/tightness → ca
+- chest/pressure/tightness → capture chest pain details + red flags
+- headache → headache details + red flags
+- cough/fever/sore throat → URI details + red flags
+"""
 
+SUMMARY_TASK = """
+You are assisting a clinician.
+
+TASK:
+- Write a concise clinical summary (max 150 words).
+- Highlight red flags.
+- Provide up to 4 differential diagnoses ranked from most to least likely.
+- For the most likely differential, list key history or exam findings that support it.
+- Recommend next steps and first-line treatment.
+- For each recommended diagnostic test, briefly explain the rationale.
+- Under 'Consult Suggestions', include key questions (with why) and key examinations (with why).
+- Use bullet points, ranked lists, and concise medical clarity. No disclaimers.
+
+INPUTS:
+- Structured patient profile (JSON) with demographics, chief complaint, modules, medications, allergies, PMHx, FHx, SHx, red flags, notes.
+- Conversation transcript (user/assistant turns). Prefer structured data as source of truth.
+
+OUTPUT:
+Return plain markdown bullets — no preamble, no code fences.
+"""
+
+# (helper functions, run_patient_mode, run_doctor_dashboard, and routing go here — unchanged from the last block I gave you, including the skip-QR button inside run_doctor_dashboard)
