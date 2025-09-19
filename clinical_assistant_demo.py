@@ -1,177 +1,92 @@
-# clinical_assistant_demo.py — Patient/Doctor split + doctor-linked QR + auto-routed summaries + transcript save
+# clinical_assistant_demo.py — Demographics form + ChatGPT-style intake + deterministic stop + 30Q cap + AI summary
 import json
-import time
-import io
-import uuid
-import hashlib
-import hmac
-from urllib.parse import urlencode
-
 import streamlit as st
 from openai import OpenAI
-
-# Optional QR lib (graceful fallback if not installed)
-try:
-    import qrcode
-    _HAVE_QR = True
-except ModuleNotFoundError:
-    qrcode = None
-    _HAVE_QR = False
 
 # ─────────────────────────────────────────────
 # Setup
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Clinical Intake (Demo)", layout="centered")
+st.title("🩺 Clinical Intake – Chat Demo")
+st.caption("Prototype only. Not medical advice.")
+
 client = OpenAI()  # key already configured in your env/secrets
 
 # ─────────────────────────────────────────────
-# Auth + doctor registry + inbox
+# State
 # ─────────────────────────────────────────────
-AUTH = st.secrets.get("auth", {})
-APP_BASE_URL = (AUTH.get("app_base_url") or "").rstrip("/")
-if not APP_BASE_URL:
-    st.warning(
-        "QR will use http://localhost:8501 since [auth].app_base_url is not set in secrets. "
-        "Set it to your deployed host to share QR across devices."
-    )
-    APP_BASE_URL = "http://localhost:8501"
-AUTH_SALT = AUTH.get("salt", "change-this-salt")
-USERS = AUTH.get("users", [])
-
-def _sha256(pw: str, salt: str) -> str:
-    return hashlib.sha256((pw + salt).encode("utf-8")).hexdigest()
-
-def _verify_pw(username: str, password: str):
-    for u in USERS:
-        if u.get("username") == username:
-            expected = str(u.get("password_sha256", "")).strip()
-            got = _sha256(password, AUTH_SALT)
-            if hmac.compare_digest(expected, got):
-                return {"username": username, "display_name": u.get("display_name", username)}
-    if not USERS and username == "demo" and password == "demo":
-        return {"username": "demo", "display_name": "Demo Doctor"}
-    return None
-
-def require_login():
-    if st.session_state.get("auth_user"):
-        return st.session_state["auth_user"]
-    st.title("📋 Doctor Dashboard")
-    st.header("🔐 Login")
-    with st.form("login_form"):
-        u = st.text_input("Username", value="demo" if not USERS else "")
-        p = st.text_input("Password", type="password", value="demo" if not USERS else "")
-        ok = st.form_submit_button("Sign in")
-    if ok:
-        user = _verify_pw(u, p)
-        if user:
-            st.session_state["auth_user"] = user
-            st.success(f"Welcome, {user['display_name']}!")
-            st.rerun()
-        else:
-            st.error("Invalid credentials.")
-    st.stop()
-
-@st.cache_resource
-def doctor_store():
-    store = {}
-    if USERS:
-        for u in USERS:
-            did = f"doc_{u['username']}"
-            store[did] = {"username": u["username"], "display_name": u.get("display_name", u["username"])}
-    else:
-        store["doc_demo"] = {"username": "demo", "display_name": "Demo Doctor"}
-    return store
-
-@st.cache_resource
-def inbox_store():
-    return {}
-
-def ensure_inbox(doctor_id: str):
-    inbox = inbox_store()
-    inbox.setdefault(doctor_id, [])
-    return inbox[doctor_id]
-
-def save_encounter(doctor_id: str, profile: dict, summary_md: str, transcript: list):
-    enc = {
-        "encounter_id": uuid.uuid4().hex,
-        "created_ts": int(time.time()),
-        "profile": profile,
-        "summary_md": summary_md,
-        "transcript": transcript,
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "profile" not in st.session_state:
+    st.session_state.profile = {
+        "demographics": {},           # {name, age_years, sex, ...}
+        "chief_complaint": None,
+        "modules": {},                # symptom-specific blobs (model-defined)
+        "medications": [],            # [{name,dose,route,frequency}]
+        "allergies": [],              # [{substance,reaction}]
+        "past_medical_history": None, # str or dict
+        "family_history": None,       # str or dict
+        "social_history": None,       # str or dict
+        "red_flags": [],              # collected silently
+        "red_flags_checked": False,   # set true once screened
+        "free_text_notes": []
     }
-    ensure_inbox(doctor_id).append(enc)
-    return enc["encounter_id"]
-
-def doctor_id_for_user(user) -> str | None:
-    uname = user.get("username") if user else None
-    for did, meta in doctor_store().items():
-        if meta["username"] == uname:
-            return did
-    return None
-
-def make_patient_link(doctor_id: str) -> str:
-    params = urlencode({"mode": "patient", "doc": doctor_id})
-    return f"{APP_BASE_URL}/?{params}"
-
-def _make_qr_png(data_url: str):
-    if not _HAVE_QR:
-        return None
-    qr = qrcode.QRCode(box_size=6, border=2)
-    qr.add_data(data_url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
-# ─────────────────────────────────────────────
-# URL params
-# ─────────────────────────────────────────────
-try:
-    qp = st.query_params  # Streamlit ≥1.32
-    _new_qp = True
-except Exception:
-    qp = st.experimental_get_query_params()
-    _new_qp = False
-
-def _qp_get(key: str, default: str = "") -> str:
-    raw = qp.get(key) if _new_qp else qp.get(key, [default])
-    if isinstance(raw, (list, tuple)):
-        return raw[0] if raw else default
-    return str(raw or default)
-
-APP_MODE  = (_qp_get("mode") or "").lower()
-DOCTOR_ID = _qp_get("doc") or None
-
-# ─────────────────────────────────────────────
-# Patient state
-# ─────────────────────────────────────────────
-def init_patient_state():
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "profile" not in st.session_state:
-        st.session_state.profile = {
-            "demographics": {},
-            "chief_complaint": None,
-            "modules": {},
-            "medications": [],
-            "allergies": [],
-            "past_medical_history": None,
-            "family_history": None,
-            "social_history": None,
-            "red_flags": [],
-            "red_flags_checked": False,
-            "free_text_notes": []
-        }
-    if "asked_questions" not in st.session_state:
-        st.session_state.asked_questions = []
-    if "final_summary" not in st.session_state:
-        st.session_state.final_summary = None
-    if "q_count" not in st.session_state:
-        st.session_state.q_count = 0
+if "asked_questions" not in st.session_state:
+    st.session_state.asked_questions = []
+if "final_summary" not in st.session_state:
+    st.session_state.final_summary = None
+if "q_count" not in st.session_state:
+    st.session_state.q_count = 0  # assistant questions asked (excl. final thank-you)
 
 MAX_QUESTIONS = 30
+
+# ─────────────────────────────────────────────
+# Static Demographics Form (above chat)
+# ─────────────────────────────────────────────
+with st.form("demographics_form", clear_on_submit=False):
+    st.subheader("Patient Demographics")
+    name = st.text_input("Full Name", value=st.session_state.profile["demographics"].get("name", ""))
+    age = st.number_input(
+        "Age (years)", min_value=0, max_value=120, step=1,
+        value=int(st.session_state.profile["demographics"].get("age_years") or 0)
+    )
+    sex = st.selectbox(
+        "Sex at Birth",
+        ["", "Male", "Female", "Intersex", "Prefer not to say"],
+        index=["", "Male", "Female", "Intersex", "Prefer not to say"].index(
+            st.session_state.profile["demographics"].get("sex", "")
+        )
+    )
+    submit_demo = st.form_submit_button("Save")
+
+    if submit_demo:
+        st.session_state.profile["demographics"]["name"] = name.strip() or None
+        st.session_state.profile["demographics"]["age_years"] = age if age > 0 else None
+        st.session_state.profile["demographics"]["sex"] = sex or None
+        st.success("Demographics saved.")
+
+# ─────────────────────────────────────────────
+# Seed opening question BEFORE transcript rendering
+# ─────────────────────────────────────────────
+if not st.session_state.messages:
+    opening = "What brings you in today?"
+    st.session_state.messages.append({"role": "assistant", "content": opening})
+    st.session_state.asked_questions.append(opening)
+    st.session_state.q_count = 1
+
+# ─────────────────────────────────────────────
+# Deterministic stop rules
+# ─────────────────────────────────────────────
+REQUIRED_SECTIONS = [
+    "chief_complaint",
+    "demographics",
+    "past_medical_history",
+    "medications",
+    "allergies",
+    "family_history",
+    "social_history",
+    "red_flags_checked",
+]
 
 def history_complete(profile: dict) -> bool:
     if not profile.get("chief_complaint"):
@@ -190,7 +105,7 @@ def history_complete(profile: dict) -> bool:
     return True
 
 # ─────────────────────────────────────────────
-# System prompts
+# System prompt (history taking & stop signal for the MODEL)
 # ─────────────────────────────────────────────
 SYSTEM = """
 You are a clinical intake assistant for a primary care clinic.
@@ -218,10 +133,10 @@ When you have enough information to form a proper differential diagnosis and a c
 }
 
 Each turn, reply with ONLY strict JSON (no backticks, no extra prose) with keys:
-- next_question: string
-- extracted_fields: object
-- red_flags: string[]
-- rationale: string
+- next_question: string  # the single next question OR the final thank-you line
+- extracted_fields: object  # structured data parsed from the patient's last answer (mergeable)
+- red_flags: string[]  # any detected red flags (for clinician only)
+- rationale: string    # short reason for your next question/finish
 
 Normalization:
 - Dates → ISO yyyy-mm-dd when possible (approx allowed: "~2025-08-01")
@@ -241,25 +156,254 @@ Routing hint examples (do not repeat to user):
 - cough/fever/sore throat → URI details + red flags
 """
 
-SUMMARY_TASK = """
-You are assisting a clinician.
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+def merge_profile(profile: dict, extracted: dict) -> dict:
+    if not extracted:
+        return profile
+
+    if extracted.get("chief_complaint") and not profile.get("chief_complaint"):
+        profile["chief_complaint"] = extracted["chief_complaint"]
+
+    if isinstance(extracted.get("demographics"), dict):
+        profile["demographics"] = {**profile.get("demographics", {}), **extracted["demographics"]}
+
+    if isinstance(extracted.get("medications"), list):
+        seen = {(m.get("name"), m.get("dose"), m.get("route"), m.get("frequency")) for m in profile["medications"]}
+        for m in extracted["medications"]:
+            key = (m.get("name"), m.get("dose"), m.get("route"), m.get("frequency"))
+            if key not in seen:
+                profile["medications"].append(m); seen.add(key)
+
+    if isinstance(extracted.get("allergies"), list):
+        seen = {(a.get("substance"), a.get("reaction")) for a in profile["allergies"]}
+        for a in extracted["allergies"]:
+            key = (a.get("substance"), a.get("reaction"))
+            if key not in seen:
+                profile["allergies"].append(a); seen.add(key)
+
+    if extracted.get("past_medical_history"):
+        profile["past_medical_history"] = extracted["past_medical_history"]
+    if extracted.get("family_history"):
+        profile["family_history"] = extracted["family_history"]
+    if extracted.get("social_history"):
+        profile["social_history"] = extracted["social_history"]
+
+    if isinstance(extracted.get("modules"), dict):
+        for mod, data in extracted["modules"].items():
+            profile["modules"][mod] = {**profile["modules"].get(mod, {}), **data}
+
+    if isinstance(extracted.get("free_text_notes"), list):
+        profile["free_text_notes"].extend(extracted["free_text_notes"])
+
+    if "red_flags_checked" in extracted:
+        profile["red_flags_checked"] = bool(extracted["red_flags_checked"])
+
+    return profile
+
+def process_red_flags(new_flags):
+    if not new_flags:
+        return
+    for f in new_flags:
+        if f not in st.session_state.profile["red_flags"]:
+            st.session_state.profile["red_flags"].append(f)
+
+def full_messages(user_text: str):
+    msgs = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": f"PROFILE:{json.dumps(st.session_state.profile, ensure_ascii=False)}"},
+        {"role": "system", "content": f"ASKED_QUESTIONS:{json.dumps(st.session_state.asked_questions[-50:], ensure_ascii=False)}"},
+        {"role": "system", "content": ROUTING_HINT.strip()},
+    ]
+    msgs.extend(st.session_state.messages)  # ENTIRE transcript
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+def call_json(user_text: str):
+    resp = client.chat.completions.create(
+        model="gpt-4o",  # for fidelity; swap to -mini later if needed
+        messages=full_messages(user_text),
+        temperature=0.1,
+        max_tokens=700,
+        response_format={"type": "json_object"},
+    )
+    raw = resp.choices[0].message.content
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {
+            "next_question": "Sorry, I didn’t catch that. Could you rephrase?",
+            "extracted_fields": {},
+            "red_flags": ["parse_error"],
+            "rationale": "Non-JSON; safety fallback."
+        }
+
+def regenerate_advance(user_text: str, avoid_q: str):
+    msgs = full_messages(user_text)
+    msgs.append({"role":"user","content":f"[META] Do NOT repeat: {avoid_q}. Ask a different, advancing question."})
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=msgs,
+        temperature=0.1,
+        max_tokens=700,
+        response_format={"type":"json_object"},
+    )
+    return json.loads(resp.choices[0].message.content)
+
+# ---- Clinician Summary via ChatGPT ------------------------------------------
+SUMMARY_TASK = """You are assisting a clinician.
 
 TASK:
-- Write a concise clinical summary (max 150 words).
-- Highlight red flags.
-- Provide up to 4 differential diagnoses ranked from most to least likely.
-- For the most likely differential, list key history or exam findings that support it.
-- Recommend next steps and first-line treatment.
-- For each recommended diagnostic test, briefly explain the rationale.
-- Under 'Consult Suggestions', include key questions (with why) and key examinations (with why).
-- Use bullet points, ranked lists, and concise medical clarity. No disclaimers.
+- Write a concise clinical summary (max 150 words)
+- Highlight red flags
+- Give 2–4 differential diagnoses
+- Recommend next steps and first-line treatment
+- Use bullet points and medical clarity. No disclaimers.
 
 INPUTS:
-- Structured patient profile (JSON) with demographics, chief complaint, modules, medications, allergies, PMHx, FHx, SHx, red flags, notes.
-- Conversation transcript (user/assistant turns). Prefer structured data as source of truth.
+- Structured patient profile (JSON) with demographics, chief complaint, modules (symptom details), medications, allergies, past medical history, family history, social history, red flags, and notes.
+- Conversation transcript (user/assistant turns). Use it only to clarify context; prefer structured data as source of truth.
 
 OUTPUT:
 Return plain markdown bullets — no preamble, no code fences.
 """
 
-# (helper functions, run_patient_mode, run_doctor_dashboard, and routing go here — unchanged from the last block I gave you, including the skip-QR button inside run_doctor_dashboard)
+def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) -> str:
+    compact_transcript = []
+    for m in transcript[-60:]:  # last 60 turns max
+        role = m.get("role", "")
+        text = m.get("content", "")
+        if role in ("user", "assistant"):
+            compact_transcript.append(f"{role.UPPER() if hasattr(role,'upper') else str(role).upper()}: {text}")
+    transcript_text = "\n".join(compact_transcript)
+
+    messages = [
+        {"role": "system", "content": SUMMARY_TASK},
+        {"role": "user", "content":
+            "STRUCTURED_PROFILE_JSON:\n" + json.dumps(profile, ensure_ascii=False) +
+            "\n\nTRANSCRIPT:\n" + transcript_text +
+            "\n\nWrite the summary now."}
+    ]
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.1,
+        max_tokens=500,
+    )
+    return resp.choices[0].message.content.strip()
+
+def finish_and_summarize():
+    """Emit final message, generate summary, and stop the app run."""
+    final_message = "Thank you for answering my questions. Your history is being forwarded to your doctor!"
+    st.session_state.messages.append({"role": "assistant", "content": final_message})
+    st.session_state.asked_questions.append(final_message)
+    try:
+        st.session_state.final_summary = generate_clinician_summary_via_model(
+            st.session_state.profile,
+            st.session_state.messages
+        )
+    except Exception:
+        st.session_state.final_summary = None
+    with st.sidebar:
+        st.header("Clinician summary (AI-generated)")
+        if st.session_state.final_summary:
+            st.markdown(st.session_state.final_summary)
+        else:
+            st.write("Summary unavailable. Try again from the sidebar.")
+    st.stop()
+
+# ─────────────────────────────────────────────
+# UI – transcript
+# ─────────────────────────────────────────────
+with st.expander("Structured profile (debug)", expanded=False):
+    st.json(st.session_state.profile, expanded=False)
+
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.write(m["content"])
+
+# ─────────────────────────────────────────────
+# Chat input
+# ─────────────────────────────────────────────
+user_text = st.chat_input("Type your answer…")
+if user_text:
+    # 1) append user turn
+    st.session_state.messages.append({"role": "user", "content": user_text})
+
+    # 2) get JSON step
+    data = call_json(user_text)
+
+    # 3) merge structured data and capture red flags silently
+    st.session_state.profile = merge_profile(st.session_state.profile, data.get("extracted_fields", {}))
+    process_red_flags(data.get("red_flags", []))
+
+    # 4) deterministic stop checks BEFORE asking the next question
+    if history_complete(st.session_state.profile) or st.session_state.q_count >= MAX_QUESTIONS:
+        finish_and_summarize()
+
+    # 5) next question or completion (model-driven)
+    next_q = (data.get("next_question") or "Please tell me more.").strip()
+
+    # 6) de-dupe (avoid repeating last assistant question)
+    last_assistant = next(
+        (m["content"].strip() for m in reversed(st.session_state.messages) if m["role"] == "assistant"),
+        ""
+    )
+    if last_assistant and next_q.lower() == last_assistant.lower():
+        try:
+            data2 = regenerate_advance(user_text, last_assistant)
+            st.session_state.profile = merge_profile(st.session_state.profile, data2.get("extracted_fields", {}))
+            process_red_flags(data2.get("red_flags", []))
+            next_q = (data2.get("next_question") or "Thanks—please add one new detail.").strip()
+        except Exception:
+            next_q = "Thanks—please add one new detail."
+
+    # 7) if model announced completion, finish
+    if next_q.lower().startswith("thank you for answering my questions"):
+        finish_and_summarize()
+
+    # 8) otherwise continue the interview
+    st.session_state.messages.append({"role": "assistant", "content": next_q})
+    st.session_state.asked_questions.append(next_q)
+    st.session_state.q_count += 1
+    if st.session_state.q_count >= MAX_QUESTIONS:
+        finish_and_summarize()
+
+    st.rerun()
+
+# ─────────────────────────────────────────────
+# Sidebar – actions
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.header("Actions")
+    if st.button("Generate clinician summary now"):
+        try:
+            st.session_state.final_summary = generate_clinician_summary_via_model(
+                st.session_state.profile,
+                st.session_state.messages
+            )
+            st.markdown(st.session_state.final_summary)
+        except Exception:
+            st.warning("Summary generation failed. Please try again.")
+    st.markdown(f"**Questions asked:** {st.session_state.q_count} / {MAX_QUESTIONS}")
+
+    if st.button("Reset conversation"):
+        st.session_state.messages = []
+        st.session_state.profile = {
+            "demographics": {},
+            "chief_complaint": None,
+            "modules": {},
+            "medications": [],
+            "allergies": [],
+            "past_medical_history": None,
+            "family_history": None,
+            "social_history": None,
+            "red_flags": [],
+            "red_flags_checked": False,
+            "free_text_notes": []
+        }
+        st.session_state.asked_questions = []
+        st.session_state.final_summary = None
+        st.session_state.q_count = 0
+        st.rerun()
