@@ -540,15 +540,15 @@ def run_doctor_dashboard():
         st.info("Install `qrcode[pil]` to render a QR image. The link above still works.")
 
     st.markdown("### Quick Demo")
-    if st.button("▶️ Start patient demo (skip QR)"):
-        for k in ["messages","profile","asked_questions","final_summary","q_count","encounter_doctor_id"]:
-            st.session_state.pop(k, None)
-        run_patient_mode(did)
-        st.stop()
-
-    st.markdown("### Inbox")
-    inbox = ensure_inbox(did)
-
+if st.button("▶️ Start patient demo (skip QR)"):
+    for k in ["messages","profile","asked_questions","final_summary","q_count","encounter_doctor_id"]:
+        st.session_state.pop(k, None)
+    try:
+        st.query_params.update({"mode":"patient","doc":did})      # Streamlit ≥ 1.32
+    except Exception:
+        st.experimental_set_query_params(mode="patient", doc=did) # older Streamlit
+    st.rerun()
+        
     st.markdown("### Inbox")
     inbox = ensure_inbox(did)
     if not inbox:
