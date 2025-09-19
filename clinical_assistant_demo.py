@@ -28,7 +28,13 @@ client = OpenAI()  # key already configured in your env/secrets
 # Simple auth (demo/demo fallback) + doctor registry + inbox (in-memory demo)
 # ─────────────────────────────────────────────
 AUTH = st.secrets.get("auth", {})
-APP_BASE_URL = (AUTH.get("app_base_url") or "http://localhost:8501").rstrip("/")
+APP_BASE_URL = (AUTH.get("app_base_url") or "").rstrip("/")
+if not APP_BASE_URL:
+    st.warning(
+        "QR will use http://localhost:8501 since [auth].app_base_url is not set in secrets. "
+        "Set it to your deployed host to share QR across devices."
+    )
+    APP_BASE_URL = "http://localhost:8501"
 AUTH_SALT = AUTH.get("salt", "change-this-salt")
 USERS = AUTH.get("users", [])
 
@@ -124,21 +130,22 @@ def _make_qr_png(data_url: str):
     return buf
 
 # ─────────────────────────────────────────────
-# URL params (new API with fallback)
+# URL params (new API with fallback) — hardened getter
 # ─────────────────────────────────────────────
 try:
-    qp = st.query_params  # Streamlit ≥ 1.32
+    qp = st.query_params  # Streamlit ≥ 1.32 returns dict-like
     _new_qp = True
 except Exception:
     qp = st.experimental_get_query_params()
     _new_qp = False
 
 def _qp_get(key: str, default: str = "") -> str:
-    if _new_qp:
-        return (qp.get(key) or default)
-    return (qp.get(key, [default])[0] or default)
+    raw = qp.get(key) if _new_qp else qp.get(key, [default])
+    if isinstance(raw, (list, tuple)):
+        return raw[0] if raw else default
+    return str(raw or default)
 
-APP_MODE  = _qp_get("mode").lower()
+APP_MODE  = (_qp_get("mode") or "").lower()
 DOCTOR_ID = _qp_get("doc") or None
 
 # ─────────────────────────────────────────────
@@ -173,11 +180,6 @@ MAX_QUESTIONS = 30
 # ─────────────────────────────────────────────
 # Deterministic stop rules (unchanged)
 # ─────────────────────────────────────────────
-REQUIRED_SECTIONS = [
-    "chief_complaint","demographics","past_medical_history","medications",
-    "allergies","family_history","social_history","red_flags_checked",
-]
-
 def history_complete(profile: dict) -> bool:
     if not profile.get("chief_complaint"):
         return False
@@ -241,340 +243,5 @@ Output ONLY the JSON object. Nothing else.
 
 ROUTING_HINT = """
 Routing hint examples (do not repeat to user):
-- chest/pressure/tightness → capture chest pain details + red flags
-- headache → headache details + red flags
-- cough/fever/sore throat → URI details + red flags
-"""
+- chest/pressure/tightness → ca
 
-SUMMARY_TASK = """
-You are assisting a clinician.
-
-TASK:
-- Write a concise clinical summary (max 150 words).
-- Highlight red flags.
-- Provide up to 4 differential diagnoses ranked from most to least likely.
-- For the most likely differential, list key history or exam findings that support it.
-- Recommend next steps and first-line treatment.
-- For each recommended diagnostic test, briefly explain the rationale.
-- Under 'Consult Suggestions', include key questions (with why) and key examinations (with why).
-- Use bullet points, ranked lists, and concise medical clarity. No disclaimers.
-
-INPUTS:
-- Structured patient profile (JSON) with demographics, chief complaint, modules, medications, allergies, PMHx, FHx, SHx, red flags, notes.
-- Conversation transcript (user/assistant turns). Prefer structured data as source of truth.
-
-OUTPUT:
-Return plain markdown bullets — no preamble, no code fences.
-"""
-
-# ─────────────────────────────────────────────
-# Helpers (unchanged logic, just grouped)
-# ─────────────────────────────────────────────
-def merge_profile(profile: dict, extracted: dict) -> dict:
-    if not extracted:
-        return profile
-    if extracted.get("chief_complaint") and not profile.get("chief_complaint"):
-        profile["chief_complaint"] = extracted["chief_complaint"]
-    if isinstance(extracted.get("demographics"), dict):
-        profile["demographics"] = {**profile.get("demographics", {}), **extracted["demographics"]}
-    if isinstance(extracted.get("medications"), list):
-        seen = {(m.get("name"), m.get("dose"), m.get("route"), m.get("frequency")) for m in profile["medications"]}
-        for m in extracted["medications"]:
-            key = (m.get("name"), m.get("dose"), m.get("route"), m.get("frequency"))
-            if key not in seen:
-                profile["medications"].append(m); seen.add(key)
-    if isinstance(extracted.get("allergies"), list):
-        seen = {(a.get("substance"), a.get("reaction")) for a in profile["allergies"]}
-        for a in extracted["allergies"]:
-            key = (a.get("substance"), a.get("reaction"))
-            if key not in seen:
-                profile["allergies"].append(a); seen.add(key)
-    if extracted.get("past_medical_history"):
-        profile["past_medical_history"] = extracted["past_medical_history"]
-    if extracted.get("family_history"):
-        profile["family_history"] = extracted["family_history"]
-    if extracted.get("social_history"):
-        profile["social_history"] = extracted["social_history"]
-    if isinstance(extracted.get("modules"), dict):
-        for mod, data in extracted["modules"].items():
-            profile["modules"][mod] = {**profile["modules"].get(mod, {}), **data}
-    if isinstance(extracted.get("free_text_notes"), list):
-        profile["free_text_notes"].extend(extracted["free_text_notes"])
-    if "red_flags_checked" in extracted:
-        profile["red_flags_checked"] = bool(extracted["red_flags_checked"])
-    return profile
-
-def process_red_flags(new_flags):
-    if not new_flags:
-        return
-    for f in new_flags:
-        if f not in st.session_state.profile["red_flags"]:
-            st.session_state.profile["red_flags"].append(f)
-
-def full_messages(user_text: str):
-    msgs = [
-        {"role": "system", "content": SYSTEM},
-        {"role": "system", "content": f"PROFILE:{json.dumps(st.session_state.profile, ensure_ascii=False)}"},
-        {"role": "system", "content": f"ASKED_QUESTIONS:{json.dumps(st.session_state.asked_questions[-50:], ensure_ascii=False)}"},
-        {"role": "system", "content": ROUTING_HINT.strip()},
-    ]
-    msgs.extend(st.session_state.messages)
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
-
-def call_json(user_text: str):
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=full_messages(user_text),
-        temperature=0.1,
-        max_tokens=700,
-        response_format={"type": "json_object"},
-    )
-    raw = resp.choices[0].message.content
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {
-            "next_question": "Sorry, I didn’t catch that. Could you rephrase?",
-            "extracted_fields": {},
-            "red_flags": ["parse_error"],
-            "rationale": "Non-JSON; safety fallback."
-        }
-
-def regenerate_advance(user_text: str, avoid_q: str):
-    msgs = full_messages(user_text)
-    msgs.append({"role":"user","content":f"[META] Do NOT repeat: {avoid_q}. Ask a different, advancing question."})
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=msgs,
-        temperature=0.1,
-        max_tokens=700,
-        response_format={"type":"json_object"},
-    )
-    return json.loads(resp.choices[0].message.content)
-
-def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) -> str:
-    compact_transcript = []
-    for m in transcript[-60:]:
-        role = m.get("role", "")
-        text = m.get("content", "")
-        if role in ("user", "assistant"):
-            compact_transcript.append(f"{role.upper() if hasattr(role,'upper') else str(role).upper()}: {text}")
-    transcript_text = "\n".join(compact_transcript)
-    messages = [
-        {"role": "system", "content": SUMMARY_TASK},
-        {"role": "user", "content":
-            "STRUCTURED_PROFILE_JSON:\n" + json.dumps(profile, ensure_ascii=False) +
-            "\n\nTRANSCRIPT:\n" + transcript_text +
-            "\n\nWrite the summary now."}
-    ]
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        temperature=0.1,
-        max_tokens=500,
-    )
-    return resp.choices[0].message.content.strip()
-
-# ─────────────────────────────────────────────
-# Patient-mode finish: AUTO-SUBMIT summary → doctor inbox (patient never sees it)
-# ─────────────────────────────────────────────
-def finish_and_summarize(patient_mode: bool):
-    final_message = "Thank you for answering my questions. Your history is being forwarded to your doctor!"
-    st.session_state.messages.append({"role": "assistant", "content": final_message})
-    st.session_state.asked_questions.append(final_message)
-
-    try:
-        final_summary = generate_clinician_summary_via_model(
-            st.session_state.profile,
-            st.session_state.messages
-        )
-    except Exception:
-        final_summary = None
-
-    # Always save to the assigned doctor (from QR) when in patient mode
-    if patient_mode:
-        doc_id = st.session_state.get("encounter_doctor_id")
-        if doc_id:
-            save_encounter(doc_id, st.session_state.profile, final_summary, st.session_state.messages)
-        # Thank the patient; DO NOT show the summary
-        st.success("✅ Your intake is complete. You may now close this page.")
-        st.stop()
-    else:
-        # Doctor-triggered generation (rare): show in sidebar
-        st.sidebar.header("Clinician summary (AI-generated)")
-        if final_summary:
-            st.sidebar.markdown(final_summary)
-        else:
-            st.sidebar.write("Summary unavailable.")
-        st.stop()
-
-# ─────────────────────────────────────────────
-# Patient mode page (form + chat only)
-# ─────────────────────────────────────────────
-def run_patient_mode(doctor_id: str):
-    init_patient_state()
-    st.title("🩺 Clinical Intake – Chat Demo")
-    doc_meta = doctor_store().get(doctor_id)
-    st.session_state["encounter_doctor_id"] = doctor_id
-    st.caption(f"Prototype only. Submitting to **{doc_meta['display_name'] if doc_meta else doctor_id}**.")
-
-    # Static Demographics Form
-    with st.form("demographics_form", clear_on_submit=False):
-        st.subheader("Patient Demographics")
-        name = st.text_input("Full Name", value=st.session_state.profile["demographics"].get("name", ""))
-        age = st.number_input(
-            "Age (years)", min_value=0, max_value=120, step=1,
-            value=int(st.session_state.profile["demographics"].get("age_years") or 0)
-        )
-        sex = st.selectbox(
-            "Sex at Birth",
-            ["", "Male", "Female", "Intersex", "Prefer not to say"],
-            index=["", "Male", "Female", "Intersex", "Prefer not to say"].index(
-                st.session_state.profile["demographics"].get("sex", "")
-            )
-        )
-        submit_demo = st.form_submit_button("Save")
-        if submit_demo:
-            st.session_state.profile["demographics"]["name"] = name.strip() or None
-            st.session_state.profile["demographics"]["age_years"] = age if age > 0 else None
-            st.session_state.profile["demographics"]["sex"] = sex or None
-            st.success("Demographics saved.")
-
-    # Seed opening question before transcript
-    if not st.session_state.messages:
-        opening = "What brings you in today?"
-        st.session_state.messages.append({"role": "assistant", "content": opening})
-        st.session_state.asked_questions.append(opening)
-        st.session_state.q_count = 1
-
-    # Debug profile expander (keep, but fine to hide)
-    with st.expander("Structured profile (debug)", expanded=False):
-        st.json(st.session_state.profile, expanded=False)
-
-    # Transcript render
-    for m in st.session_state.messages:
-        with st.chat_message(m["role"]):
-            st.write(m["content"])
-
-    # Chat input (auto-submit when complete)
-    user_text = st.chat_input("Type your answer…")
-    if user_text:
-        # 1) append user turn
-        st.session_state.messages.append({"role": "user", "content": user_text})
-
-        # 2) model JSON step
-        data = call_json(user_text)
-
-        # 3) merge structured + red flags
-        st.session_state.profile = merge_profile(st.session_state.profile, data.get("extracted_fields", {}))
-        process_red_flags(data.get("red_flags", []))
-
-        # 4) deterministic stop BEFORE next question
-        if history_complete(st.session_state.profile) or st.session_state.q_count >= MAX_QUESTIONS:
-            finish_and_summarize(patient_mode=True)
-
-        # 5) next question or completion (model-driven)
-        next_q = (data.get("next_question") or "Please tell me more.").strip()
-
-        # 6) de-dupe
-        last_assistant = next((m["content"].strip() for m in reversed(st.session_state.messages) if m["role"] == "assistant"), "")
-        if last_assistant and next_q.lower() == last_assistant.lower():
-            try:
-                data2 = regenerate_advance(user_text, last_assistant)
-                st.session_state.profile = merge_profile(st.session_state.profile, data2.get("extracted_fields", {}))
-                process_red_flags(data2.get("red_flags", []))
-                next_q = (data2.get("next_question") or "Thanks—please add one new detail.").strip()
-            except Exception:
-                next_q = "Thanks—please add one new detail."
-
-        # 7) if model announced completion, auto-finish
-        if next_q.lower().startswith("thank you for answering my questions"):
-            finish_and_summarize(patient_mode=True)
-
-        # 8) otherwise continue the interview
-        st.session_state.messages.append({"role": "assistant", "content": next_q})
-        st.session_state.asked_questions.append(next_q)
-        st.session_state.q_count += 1
-        if st.session_state.q_count >= MAX_QUESTIONS:
-            finish_and_summarize(patient_mode=True)
-
-        st.rerun()
-
-    # Patient sidebar = minimal
-    with st.sidebar:
-        st.header("Actions")
-        st.markdown(f"**Questions asked:** {st.session_state.q_count} / {MAX_QUESTIONS}")
-        if st.button("Reset conversation"):
-            st.session_state.messages = []
-            st.session_state.profile = {
-                "demographics": {}, "chief_complaint": None, "modules": {},
-                "medications": [], "allergies": [], "past_medical_history": None,
-                "family_history": None, "social_history": None, "red_flags": [],
-                "red_flags_checked": False, "free_text_notes": []
-            }
-            st.session_state.asked_questions = []
-            st.session_state.final_summary = None
-            st.session_state.q_count = 0
-            st.rerun()
-
-# ─────────────────────────────────────────────
-# Doctor dashboard (QR + inbox). No patient tools here.
-# ─────────────────────────────────────────────
-def run_doctor_dashboard():
-    user = require_login()
-    did = doctor_id_for_user(user)
-    if not did:
-        st.error("No doctor profile linked to this user.")
-        st.stop()
-
-    st.subheader(f"Welcome, {user['display_name']}")
-    link = make_patient_link(did)
-
-    st.markdown("### Patient Intake QR")
-    st.code(link)
-    qr_buf = _make_qr_png(link)
-    if qr_buf:
-        st.image(qr_buf, caption="Scan to start patient intake", use_container_width=False)
-    else:
-        st.info("Install `qrcode[pil]` to render a QR image. The link above still works.")
-
-    st.markdown("### Quick Demo")
-if st.button("▶️ Start patient demo (skip QR)"):
-    for k in ["messages","profile","asked_questions","final_summary","q_count","encounter_doctor_id"]:
-        st.session_state.pop(k, None)
-    try:
-        st.query_params.update({"mode":"patient","doc":did})      # Streamlit ≥ 1.32
-    except Exception:
-        st.experimental_set_query_params(mode="patient", doc=did) # older Streamlit
-    st.rerun()
-        
-    st.markdown("### Inbox")
-    inbox = ensure_inbox(did)
-    if not inbox:
-        st.info("No submissions yet.")
-    else:
-        # newest first
-        for enc in sorted(inbox, key=lambda e: e["created_ts"], reverse=True):
-            ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(enc["created_ts"]))
-            patient_name = enc["profile"].get("demographics", {}).get("name") or "Unknown patient"
-            chief = enc["profile"].get("chief_complaint") or "No chief complaint"
-            st.markdown(f"**{patient_name}** — {chief} — `{ts}` — `#{enc['encounter_id'][:8]}`")
-            with st.expander("Summary"):
-                st.markdown(enc["summary_md"] or "_No summary available_")
-            with st.expander("Structured profile"):
-                st.json(enc["profile"])
-            with st.expander("Transcript (not shown to patient)"):
-                st.json(enc["transcript"])
-            st.write("---")
-
-# ─────────────────────────────────────────────
-# Route by mode
-# ─────────────────────────────────────────────
-if APP_MODE == "patient":
-    if not DOCTOR_ID or DOCTOR_ID not in doctor_store():
-        st.error("Invalid or missing doctor code. Ask your clinic for a fresh QR.")
-        st.stop()
-    run_patient_mode(DOCTOR_ID)
-else:
-    run_doctor_dashboard()
