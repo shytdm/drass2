@@ -46,17 +46,21 @@ MAX_QUESTIONS = 30
 with st.form("demographics_form", clear_on_submit=False):
     st.subheader("Patient Demographics")
     name = st.text_input("Full Name", value=st.session_state.profile["demographics"].get("name", ""))
+
+    age_val = st.session_state.profile["demographics"].get("age_years")
     age = st.number_input(
         "Age (years)", min_value=0, max_value=120, step=1,
-        value=int(st.session_state.profile["demographics"].get("age_years") or 0)
+        value=int(age_val) if isinstance(age_val, (int, float)) and age_val is not None else 0
     )
-    sex = st.selectbox(
-        "Sex at Birth",
-        ["", "Male", "Female", "Intersex", "Prefer not to say"],
-        index=["", "Male", "Female", "Intersex", "Prefer not to say"].index(
-            st.session_state.profile["demographics"].get("sex", "")
-        )
-    )
+
+    sex_options = ["", "Male", "Female", "Intersex", "Prefer not to say"]
+    stored_sex = st.session_state.profile["demographics"].get("sex") or ""
+    try:
+        sex_index = sex_options.index(stored_sex)
+    except ValueError:
+        sex_index = 0
+    sex = st.selectbox("Sex at Birth", sex_options, index=sex_index)
+
     submit_demo = st.form_submit_button("Save")
 
     if submit_demo:
@@ -191,8 +195,10 @@ def merge_profile(profile: dict, extracted: dict) -> dict:
         profile["social_history"] = extracted["social_history"]
 
     if isinstance(extracted.get("modules"), dict):
-        for mod, data in extracted["modules"].items():
-            profile["modules"][mod] = {**profile["modules"].get(mod, {}), **data}
+        for mod, data in extracted.items():
+            if mod == "modules" and isinstance(data, dict):
+                for submod, subdata in data.items():
+                    profile["modules"][submod] = {**profile["modules"].get(submod, {}), **subdata}
 
     if isinstance(extracted.get("free_text_notes"), list):
         profile["free_text_notes"].extend(extracted["free_text_notes"])
@@ -209,21 +215,20 @@ def process_red_flags(new_flags):
         if f not in st.session_state.profile["red_flags"]:
             st.session_state.profile["red_flags"].append(f)
 
-def full_messages(user_text: str):
+def full_messages():
     msgs = [
         {"role": "system", "content": SYSTEM},
         {"role": "system", "content": f"PROFILE:{json.dumps(st.session_state.profile, ensure_ascii=False)}"},
         {"role": "system", "content": f"ASKED_QUESTIONS:{json.dumps(st.session_state.asked_questions[-50:], ensure_ascii=False)}"},
         {"role": "system", "content": ROUTING_HINT.strip()},
     ]
-    msgs.extend(st.session_state.messages)  # ENTIRE transcript
-    msgs.append({"role": "user", "content": user_text})
+    msgs.extend(st.session_state.messages)  # ENTIRE transcript (already includes the latest user turn)
     return msgs
 
-def call_json(user_text: str):
+def call_json():
     resp = client.chat.completions.create(
         model="gpt-4o",  # for fidelity; swap to -mini later if needed
-        messages=full_messages(user_text),
+        messages=full_messages(),
         temperature=0.1,
         max_tokens=700,
         response_format={"type": "json_object"},
@@ -239,8 +244,8 @@ def call_json(user_text: str):
             "rationale": "Non-JSON; safety fallback."
         }
 
-def regenerate_advance(user_text: str, avoid_q: str):
-    msgs = full_messages(user_text)
+def regenerate_advance(avoid_q: str):
+    msgs = full_messages()
     msgs.append({"role":"user","content":f"[META] Do NOT repeat: {avoid_q}. Ask a different, advancing question."})
     resp = client.chat.completions.create(
         model="gpt-4o",
@@ -275,7 +280,7 @@ def generate_clinician_summary_via_model(profile: dict, transcript: list[dict]) 
         role = m.get("role", "")
         text = m.get("content", "")
         if role in ("user", "assistant"):
-            compact_transcript.append(f"{role.UPPER() if hasattr(role,'upper') else str(role).upper()}: {text}")
+            compact_transcript.append(f"{str(role).upper()}: {text}")
     transcript_text = "\n".join(compact_transcript)
 
     messages = [
@@ -303,8 +308,11 @@ def finish_and_summarize():
             st.session_state.profile,
             st.session_state.messages
         )
-    except Exception:
+    except Exception as e:
         st.session_state.final_summary = None
+        with st.sidebar:
+            st.error("Summary generation failed.")
+            st.exception(e)
     with st.sidebar:
         st.header("Clinician summary (AI-generated)")
         if st.session_state.final_summary:
@@ -331,8 +339,8 @@ if user_text:
     # 1) append user turn
     st.session_state.messages.append({"role": "user", "content": user_text})
 
-    # 2) get JSON step
-    data = call_json(user_text)
+    # 2) get JSON step (no duplicate user turn injected)
+    data = call_json()
 
     # 3) merge structured data and capture red flags silently
     st.session_state.profile = merge_profile(st.session_state.profile, data.get("extracted_fields", {}))
@@ -352,7 +360,7 @@ if user_text:
     )
     if last_assistant and next_q.lower() == last_assistant.lower():
         try:
-            data2 = regenerate_advance(user_text, last_assistant)
+            data2 = regenerate_advance(last_assistant)
             st.session_state.profile = merge_profile(st.session_state.profile, data2.get("extracted_fields", {}))
             process_red_flags(data2.get("red_flags", []))
             next_q = (data2.get("next_question") or "Thanks—please add one new detail.").strip()
@@ -384,8 +392,9 @@ with st.sidebar:
                 st.session_state.messages
             )
             st.markdown(st.session_state.final_summary)
-        except Exception:
+        except Exception as e:
             st.warning("Summary generation failed. Please try again.")
+            st.exception(e)
     st.markdown(f"**Questions asked:** {st.session_state.q_count} / {MAX_QUESTIONS}")
 
     if st.button("Reset conversation"):
